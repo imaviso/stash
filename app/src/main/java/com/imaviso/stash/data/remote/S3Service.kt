@@ -70,6 +70,41 @@ class S3Service {
     private fun requireClient(): S3Client =
         client ?: throw IllegalStateException("S3 client not initialized. Please configure credentials first.")
 
+    /**
+     * Test connection with given credentials without storing them.
+     * Returns success if we can list buckets, or an error message if not.
+     */
+    suspend fun testConnection(config: S3Config): Result<String> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                Log.d(TAG, "Testing connection to: ${config.endpoint}")
+
+                // Create temporary client for testing
+                val testClient =
+                    S3Client {
+                        region = config.region
+                        endpointUrl = Url.parse(config.endpoint)
+                        credentialsProvider =
+                            StaticCredentialsProvider {
+                                accessKeyId = config.accessKey
+                                secretAccessKey = config.secretKey
+                            }
+                        forcePathStyle = config.usePathStyle
+                    }
+
+                try {
+                    val response = testClient.listBuckets(ListBucketsRequest {})
+                    val bucketCount = response.buckets?.size ?: 0
+                    Log.d(TAG, "Connection test successful: found $bucketCount buckets")
+                    "Connected successfully! Found $bucketCount bucket${if (bucketCount != 1) "s" else ""}."
+                } finally {
+                    testClient.close()
+                }
+            }.onFailure { e ->
+                Log.e(TAG, "Connection test failed: ${e.javaClass.simpleName}: ${e.message}", e)
+            }
+        }
+
     // ==================== BUCKET OPERATIONS ====================
 
     suspend fun listBuckets(): Result<List<S3Bucket>> =
@@ -125,6 +160,10 @@ class S3Service {
 
     // ==================== OBJECT OPERATIONS ====================
 
+    /**
+     * List objects in a bucket with automatic pagination.
+     * Fetches all objects by following continuation tokens.
+     */
     suspend fun listObjects(
         bucketName: String,
         prefix: String = "",
@@ -133,61 +172,73 @@ class S3Service {
         withContext(Dispatchers.IO) {
             runCatching {
                 Log.d(TAG, "Listing objects in bucket: $bucketName, prefix: $prefix")
-                val response =
-                    requireClient().listObjectsV2(
-                        ListObjectsV2Request {
-                            bucket = bucketName
-                            this.prefix = prefix
-                            this.delimiter = delimiter
-                        },
-                    )
 
-                val objects = mutableListOf<S3Object>()
-
-                // Collect folder keys from common prefixes to avoid duplicates
+                val allObjects = mutableListOf<S3Object>()
                 val folderKeys = mutableSetOf<String>()
+                var continuationToken: String? = null
+                var pageCount = 0
 
-                // Add folders (common prefixes)
-                response.commonPrefixes?.forEach { commonPrefix ->
-                    commonPrefix.prefix?.let { prefixKey ->
-                        folderKeys.add(prefixKey)
-                        objects.add(
-                            S3Object(
-                                key = prefixKey,
-                                size = 0,
-                                lastModified = null,
-                            ),
+                do {
+                    pageCount++
+                    Log.d(TAG, "Fetching page $pageCount, continuationToken: ${continuationToken?.take(20)}...")
+
+                    val response =
+                        requireClient().listObjectsV2(
+                            ListObjectsV2Request {
+                                bucket = bucketName
+                                this.prefix = prefix
+                                this.delimiter = delimiter
+                                this.continuationToken = continuationToken
+                                maxKeys = 1000
+                            },
                         )
+
+                    // Add folders (common prefixes)
+                    response.commonPrefixes?.forEach { commonPrefix ->
+                        commonPrefix.prefix?.let { prefixKey ->
+                            if (!folderKeys.contains(prefixKey)) {
+                                folderKeys.add(prefixKey)
+                                allObjects.add(
+                                    S3Object(
+                                        key = prefixKey,
+                                        size = 0,
+                                        lastModified = null,
+                                    ),
+                                )
+                            }
+                        }
                     }
-                }
 
-                // Add files (filter out folder markers and current prefix marker)
-                response.contents?.forEach { obj ->
-                    val key = obj.key ?: ""
-                    // Skip:
-                    // 1. Empty keys
-                    // 2. The current prefix itself (folder marker for current directory)
-                    // 3. Folder marker objects that we already have from commonPrefixes
-                    // 4. Zero-byte objects ending with "/" (folder markers)
-                    val isCurrentPrefix = key == prefix
-                    val isFolderMarker = key.endsWith("/") && (obj.size ?: 0) == 0L
-                    val isAlreadyInFolders = folderKeys.contains(key)
+                    // Add files (filter out folder markers and current prefix marker)
+                    response.contents?.forEach { obj ->
+                        val key = obj.key ?: ""
+                        val isCurrentPrefix = key == prefix
+                        val isFolderMarker = key.endsWith("/") && (obj.size ?: 0) == 0L
+                        val isAlreadyInFolders = folderKeys.contains(key)
 
-                    if (key.isNotEmpty() && !isCurrentPrefix && !isAlreadyInFolders && !isFolderMarker) {
-                        objects.add(
-                            S3Object(
-                                key = key,
-                                size = obj.size ?: 0,
-                                lastModified = obj.lastModified?.let { Date(it.epochSeconds * 1000) },
-                                etag = obj.eTag,
-                                storageClass = obj.storageClass?.value,
-                            ),
-                        )
+                        if (key.isNotEmpty() && !isCurrentPrefix && !isAlreadyInFolders && !isFolderMarker) {
+                            allObjects.add(
+                                S3Object(
+                                    key = key,
+                                    size = obj.size ?: 0,
+                                    lastModified = obj.lastModified?.let { Date(it.epochSeconds * 1000) },
+                                    etag = obj.eTag,
+                                    storageClass = obj.storageClass?.value,
+                                ),
+                            )
+                        }
                     }
-                }
 
-                Log.d(TAG, "Found ${objects.size} objects")
-                objects.toList()
+                    continuationToken =
+                        if (response.isTruncated == true) {
+                            response.nextContinuationToken
+                        } else {
+                            null
+                        }
+                } while (continuationToken != null)
+
+                Log.d(TAG, "Found ${allObjects.size} objects across $pageCount page(s)")
+                allObjects.toList()
             }.onFailure { e ->
                 Log.e(TAG, "Failed to list objects: ${e.message}", e)
             }

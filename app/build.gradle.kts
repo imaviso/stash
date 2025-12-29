@@ -36,7 +36,7 @@ android {
             signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
+                "proguard-rules.pro",
             )
         }
     }
@@ -90,7 +90,7 @@ dependencies {
 
     // AWS S3 SDK
     implementation("aws.sdk.kotlin:s3:1.0.30")
-    
+
     // OkHttp engine for AWS SDK
     implementation("aws.smithy.kotlin:http-client-engine-okhttp:1.0.11")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
@@ -100,6 +100,9 @@ dependencies {
 
     // DataStore for preferences
     implementation("androidx.datastore:datastore-preferences:1.0.0")
+
+    // Encrypted SharedPreferences for secure credential storage
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
     // Image loading (Coil)
     implementation("io.coil-kt:coil-compose:2.5.0")

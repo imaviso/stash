@@ -8,6 +8,8 @@ import com.imaviso.stash.data.model.S3Config
 import com.imaviso.stash.data.model.S3Object
 import com.imaviso.stash.data.remote.S3Service
 import com.imaviso.stash.data.repository.ConfigRepository
+import com.imaviso.stash.util.ErrorUtils
+import com.imaviso.stash.util.NetworkUtils
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -48,6 +50,7 @@ data class ObjectsUiState(
     val objects: List<S3Object> = emptyList(),
     val isLoading: Boolean = false,
     val error: String? = null,
+    val isOffline: Boolean = false,
     val showDeleteDialog: Boolean = false,
     val selectedObject: S3Object? = null,
     val isDeleting: Boolean = false,
@@ -99,6 +102,7 @@ data class ObjectsUiState(
 class ObjectsViewModel(
     application: Application,
 ) : AndroidViewModel(application) {
+    private val context = application.applicationContext
     private val configRepository = ConfigRepository(application)
     private val s3Service = S3Service()
 
@@ -107,6 +111,35 @@ class ObjectsViewModel(
 
     // Current running job for cancellation
     private var currentJob: Job? = null
+
+    init {
+        // Observe network connectivity
+        viewModelScope.launch {
+            NetworkUtils.observeNetworkConnectivity(context).collect { isConnected ->
+                _uiState.value = _uiState.value.copy(isOffline = !isConnected)
+                // Auto-refresh when coming back online
+                if (isConnected && _uiState.value.bucketName.isNotEmpty() && _uiState.value.objects.isEmpty()) {
+                    refresh()
+                }
+            }
+        }
+    }
+
+    /**
+     * Check network before performing an operation
+     * Returns true if network is available, false if offline (and sets error)
+     */
+    private fun checkNetwork(): Boolean {
+        if (!NetworkUtils.isNetworkAvailable(context)) {
+            _uiState.value =
+                _uiState.value.copy(
+                    isOffline = true,
+                    error = "No internet connection. Please check your network and try again.",
+                )
+            return false
+        }
+        return true
+    }
 
     // Filtered objects based on search query
     val filteredObjects: List<S3Object>
@@ -169,19 +202,30 @@ class ObjectsViewModel(
         } catch (e: Exception) {
             _uiState.value =
                 _uiState.value.copy(
-                    error = "Failed to initialize: ${e.message}",
+                    error = ErrorUtils.formatError(e),
                 )
         }
     }
 
     fun refresh() {
         viewModelScope.launch {
+            if (!checkNetwork()) return@launch
             loadObjects()
         }
     }
 
     private suspend fun loadObjects() {
-        _uiState.value = _uiState.value.copy(isLoading = true, error = null)
+        if (!NetworkUtils.isNetworkAvailable(context)) {
+            _uiState.value =
+                _uiState.value.copy(
+                    isLoading = false,
+                    isOffline = true,
+                    error = "No internet connection. Please check your network and try again.",
+                )
+            return
+        }
+
+        _uiState.value = _uiState.value.copy(isLoading = true, error = null, isOffline = false)
 
         s3Service
             .listObjects(
@@ -197,7 +241,7 @@ class ObjectsViewModel(
                 _uiState.value =
                     _uiState.value.copy(
                         isLoading = false,
-                        error = "Failed to load objects: ${e.message}",
+                        error = ErrorUtils.formatError(e),
                     )
             }
     }
@@ -311,7 +355,7 @@ class ObjectsViewModel(
                     _uiState.value =
                         _uiState.value.copy(
                             isDeleting = false,
-                            error = "Failed to delete: ${e.message}",
+                            error = ErrorUtils.formatError(e),
                         )
                 }
         }
@@ -541,7 +585,7 @@ class ObjectsViewModel(
                     _uiState.value =
                         _uiState.value.copy(
                             isDeleting = false,
-                            error = "Failed to delete: ${e.message}",
+                            error = ErrorUtils.formatError(e),
                         )
                 }
         }
@@ -773,7 +817,7 @@ class ObjectsViewModel(
                     _uiState.value =
                         _uiState.value.copy(
                             isCreatingFolder = false,
-                            error = "Failed to create folder: ${e.message}",
+                            error = ErrorUtils.formatError(e),
                         )
                 }
         }
@@ -825,7 +869,7 @@ class ObjectsViewModel(
                     _uiState.value =
                         _uiState.value.copy(
                             isRenaming = false,
-                            error = "Failed to rename: ${e.message}",
+                            error = ErrorUtils.formatError(e),
                         )
                 }
         }
@@ -932,7 +976,7 @@ class ObjectsViewModel(
                                 downloadProgress = "",
                                 downloadProgressPercent = 0f,
                                 canCancel = false,
-                                error = "Failed to prepare file: ${e.message}",
+                                error = ErrorUtils.formatError(e),
                             )
                     }
             }
