@@ -1,0 +1,36 @@
+# Built files
+*.iml
+.gradle/
+build/
+local.properties
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Android
+.cxx/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Kotlin
+*.kotlin_module
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test outputs
+app/build/
+app/release/
+
+# Keystore (keep safe, don't commit)
+*.jks
+*.keystore
