@@ -1,8 +1,13 @@
 package com.imaviso.stash.ui.viewmodel
 
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
 import com.imaviso.stash.data.model.FileType
 import com.imaviso.stash.data.model.S3Config
 import com.imaviso.stash.data.model.S3Object
@@ -10,6 +15,8 @@ import com.imaviso.stash.data.remote.S3Service
 import com.imaviso.stash.data.repository.ConfigRepository
 import com.imaviso.stash.util.ErrorUtils
 import com.imaviso.stash.util.NetworkUtils
+import com.imaviso.stash.worker.DownloadWorker
+import com.imaviso.stash.worker.UploadWorker
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -761,6 +768,216 @@ class ObjectsViewModel(
                             )
                     }
             }
+    }
+
+    // ==================== BACKGROUND TRANSFERS (WorkManager) ====================
+
+    private val workManager = WorkManager.getInstance(application)
+
+    /**
+     * Upload a file in the background using WorkManager.
+     * The upload will continue even if the app is backgrounded.
+     */
+    fun uploadFileInBackground(
+        uri: Uri,
+        fileName: String,
+        contentType: String,
+    ) {
+        val objectKey = _uiState.value.currentPrefix + fileName
+
+        val inputData =
+            UploadWorker.createInputData(
+                bucketName = _uiState.value.bucketName,
+                objectKey = objectKey,
+                fileUri = uri.toString(),
+                contentType = contentType,
+                fileName = fileName,
+            )
+
+        val uploadRequest =
+            OneTimeWorkRequestBuilder<UploadWorker>()
+                .setInputData(inputData)
+                .addTag("upload")
+                .addTag("upload_${objectKey.hashCode()}")
+                .build()
+
+        workManager.enqueueUniqueWork(
+            "upload_${objectKey.hashCode()}",
+            ExistingWorkPolicy.REPLACE,
+            uploadRequest,
+        )
+
+        // Observe the work status
+        viewModelScope.launch {
+            workManager.getWorkInfoByIdFlow(uploadRequest.id).collect { workInfo ->
+                when (workInfo?.state) {
+                    WorkInfo.State.RUNNING -> {
+                        val progress = workInfo.progress.getInt(UploadWorker.KEY_PROGRESS, 0)
+                        val status = workInfo.progress.getString(UploadWorker.KEY_STATUS) ?: ""
+                        _uiState.value =
+                            _uiState.value.copy(
+                                isUploading = true,
+                                uploadProgress =
+                                    when (status) {
+                                        UploadWorker.STATUS_PREPARING -> "Preparing $fileName..."
+                                        UploadWorker.STATUS_UPLOADING -> "Uploading $fileName ($progress%)"
+                                        else -> "Uploading $fileName..."
+                                    },
+                                uploadProgressPercent = progress / 100f,
+                                showUploadDialog = false,
+                            )
+                    }
+
+                    WorkInfo.State.SUCCEEDED -> {
+                        _uiState.value =
+                            _uiState.value.copy(
+                                isUploading = false,
+                                uploadProgress = "",
+                                uploadProgressPercent = 0f,
+                            )
+                        loadObjects()
+                    }
+
+                    WorkInfo.State.FAILED -> {
+                        val error = workInfo.outputData.getString(UploadWorker.KEY_ERROR) ?: "Upload failed"
+                        _uiState.value =
+                            _uiState.value.copy(
+                                isUploading = false,
+                                uploadProgress = "",
+                                uploadProgressPercent = 0f,
+                                error = error,
+                            )
+                    }
+
+                    WorkInfo.State.CANCELLED -> {
+                        _uiState.value =
+                            _uiState.value.copy(
+                                isUploading = false,
+                                uploadProgress = "",
+                                uploadProgressPercent = 0f,
+                            )
+                    }
+
+                    else -> { /* ENQUEUED, BLOCKED - no action needed */ }
+                }
+            }
+        }
+    }
+
+    /**
+     * Download a file in the background using WorkManager.
+     * The download will continue even if the app is backgrounded.
+     * File is saved to the Downloads folder.
+     */
+    fun downloadFileInBackground(obj: S3Object) {
+        if (obj.isFolder) return
+
+        val inputData =
+            DownloadWorker.createInputData(
+                bucketName = _uiState.value.bucketName,
+                objectKey = obj.key,
+                fileName = obj.fileName,
+                fileSize = obj.size,
+                mimeType = obj.mimeType,
+            )
+
+        val downloadRequest =
+            OneTimeWorkRequestBuilder<DownloadWorker>()
+                .setInputData(inputData)
+                .addTag("download")
+                .addTag("download_${obj.key.hashCode()}")
+                .build()
+
+        workManager.enqueueUniqueWork(
+            "download_${obj.key.hashCode()}",
+            ExistingWorkPolicy.REPLACE,
+            downloadRequest,
+        )
+
+        // Observe the work status
+        viewModelScope.launch {
+            workManager.getWorkInfoByIdFlow(downloadRequest.id).collect { workInfo ->
+                when (workInfo?.state) {
+                    WorkInfo.State.RUNNING -> {
+                        val progress = workInfo.progress.getInt(DownloadWorker.KEY_PROGRESS, 0)
+                        val status = workInfo.progress.getString(DownloadWorker.KEY_STATUS) ?: ""
+                        val bytesDownloaded = workInfo.progress.getLong(DownloadWorker.KEY_BYTES_DOWNLOADED, 0L)
+                        val totalBytes = workInfo.progress.getLong(DownloadWorker.KEY_TOTAL_BYTES, obj.size)
+
+                        val mbDownloaded = bytesDownloaded / (1024 * 1024f)
+                        val mbTotal = totalBytes / (1024 * 1024f)
+
+                        _uiState.value =
+                            _uiState.value.copy(
+                                isDownloading = true,
+                                downloadProgress =
+                                    when (status) {
+                                        DownloadWorker.STATUS_PREPARING -> {
+                                            "Preparing ${obj.fileName}..."
+                                        }
+
+                                        DownloadWorker.STATUS_DOWNLOADING -> {
+                                            "Downloading: %.1f / %.1f MB (%d%%)".format(mbDownloaded, mbTotal, progress)
+                                        }
+
+                                        else -> {
+                                            "Downloading ${obj.fileName}..."
+                                        }
+                                    },
+                                downloadProgressPercent = progress / 100f,
+                            )
+                    }
+
+                    WorkInfo.State.SUCCEEDED -> {
+                        _uiState.value =
+                            _uiState.value.copy(
+                                isDownloading = false,
+                                downloadProgress = "",
+                                downloadProgressPercent = 0f,
+                            )
+                    }
+
+                    WorkInfo.State.FAILED -> {
+                        val error = workInfo.outputData.getString(DownloadWorker.KEY_ERROR) ?: "Download failed"
+                        _uiState.value =
+                            _uiState.value.copy(
+                                isDownloading = false,
+                                downloadProgress = "",
+                                downloadProgressPercent = 0f,
+                                error = error,
+                            )
+                    }
+
+                    WorkInfo.State.CANCELLED -> {
+                        _uiState.value =
+                            _uiState.value.copy(
+                                isDownloading = false,
+                                downloadProgress = "",
+                                downloadProgressPercent = 0f,
+                            )
+                    }
+
+                    else -> { /* ENQUEUED, BLOCKED - no action needed */ }
+                }
+            }
+        }
+    }
+
+    /**
+     * Cancel all pending/running background transfers
+     */
+    fun cancelBackgroundTransfers() {
+        workManager.cancelAllWorkByTag("upload")
+        workManager.cancelAllWorkByTag("download")
+        _uiState.value =
+            _uiState.value.copy(
+                isUploading = false,
+                isDownloading = false,
+                uploadProgress = "",
+                downloadProgress = "",
+                uploadProgressPercent = 0f,
+                downloadProgressPercent = 0f,
+            )
     }
 
     // ==================== SEARCH / FILTER ====================

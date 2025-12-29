@@ -197,11 +197,9 @@ fun ObjectsScreen(
             error = uiState.previewError,
             onNavigateBack = { viewModel.closePreview() },
             onDownload = {
-                // For streaming media, need to download separately
-                if (uiState.previewStreamUrl != null) {
-                    viewModel.downloadObject(uiState.previewObject!!) { data ->
-                        saveFile(context, uiState.previewObject!!.fileName, data)
-                    }
+                // For streaming media or large files, use background download
+                if (uiState.previewStreamUrl != null || uiState.previewObject!!.size > 5 * 1024 * 1024) {
+                    viewModel.downloadFileInBackground(uiState.previewObject!!)
                 } else {
                     uiState.previewData?.let { data ->
                         saveFile(context, uiState.previewObject!!.fileName, data)
@@ -532,8 +530,14 @@ fun ObjectsScreen(
                                         }
                                     },
                                     onDownload = {
-                                        viewModel.downloadObject(obj) { data ->
-                                            saveFile(context, obj.fileName, data)
+                                        // Use background download for large files (>5MB)
+                                        // This allows downloads to continue when app is backgrounded
+                                        if (obj.size > 5 * 1024 * 1024) {
+                                            viewModel.downloadFileInBackground(obj)
+                                        } else {
+                                            viewModel.downloadObject(obj) { data ->
+                                                saveFile(context, obj.fileName, data)
+                                            }
                                         }
                                     },
                                     onOpenWith = {
@@ -1538,14 +1542,11 @@ private fun handleFileUpload(
         val contentType = contentResolver.getType(uri) ?: "application/octet-stream"
         val fileSize = getFileSize(contentResolver, uri)
 
-        // For large files (>5MB), use streaming upload to avoid OOM
+        // Use background upload for all files via WorkManager
+        // This allows uploads to continue even when app is backgrounded
         if (fileSize > 5 * 1024 * 1024) {
-            val inputStream = contentResolver.openInputStream(uri)
-            if (inputStream != null) {
-                viewModel.uploadFileFromStream(fileName, inputStream, fileSize, contentType)
-            } else {
-                Toast.makeText(context, "Failed to open file", Toast.LENGTH_SHORT).show()
-            }
+            // Large files - use WorkManager background upload
+            viewModel.uploadFileInBackground(uri, fileName, contentType)
         } else {
             // For small files, read into memory (faster)
             contentResolver.openInputStream(uri)?.use { inputStream ->
