@@ -1,4 +1,4 @@
-package com.example.composeapp.data.remote
+package com.imaviso.stash.data.remote
 
 import android.util.Log
 import aws.sdk.kotlin.runtime.auth.credentials.StaticCredentialsProvider
@@ -6,9 +6,9 @@ import aws.sdk.kotlin.services.s3.S3Client
 import aws.sdk.kotlin.services.s3.model.*
 import aws.sdk.kotlin.services.s3.presigners.presignGetObject
 import aws.smithy.kotlin.runtime.net.url.Url
-import com.example.composeapp.data.model.S3Bucket
-import com.example.composeapp.data.model.S3Config
-import com.example.composeapp.data.model.S3Object
+import com.imaviso.stash.data.model.S3Bucket
+import com.imaviso.stash.data.model.S3Config
+import com.imaviso.stash.data.model.S3Object
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import aws.smithy.kotlin.runtime.content.ByteStream

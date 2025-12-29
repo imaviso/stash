@@ -1,4 +1,4 @@
-package com.example.composeapp.ui.theme
+package com.imaviso.stash.ui.theme
 
 import android.app.Activity
 import android.os.Build

@@ -1,4 +1,4 @@
-package com.example.composeapp.ui.screens
+package com.imaviso.stash.ui.screens
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -21,8 +21,8 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.example.composeapp.data.model.S3Account
-import com.example.composeapp.ui.viewmodel.ConfigViewModel
+import com.imaviso.stash.data.model.S3Account
+import com.imaviso.stash.ui.viewmodel.ConfigViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable

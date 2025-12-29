@@ -1,4 +1,4 @@
-package com.example.composeapp.ui.theme
+package com.imaviso.stash.ui.theme
 
 import androidx.compose.ui.graphics.Color
 

@@ -1,4 +1,4 @@
-package com.example.composeapp.ui.navigation
+package com.imaviso.stash.ui.navigation
 
 import androidx.compose.runtime.Composable
 import androidx.navigation.NavHostController
@@ -6,9 +6,9 @@ import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.navArgument
-import com.example.composeapp.ui.screens.BucketsScreen
-import com.example.composeapp.ui.screens.ConfigScreen
-import com.example.composeapp.ui.screens.ObjectsScreen
+import com.imaviso.stash.ui.screens.BucketsScreen
+import com.imaviso.stash.ui.screens.ConfigScreen
+import com.imaviso.stash.ui.screens.ObjectsScreen
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets

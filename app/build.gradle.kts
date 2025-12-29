@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.composeapp"
+    namespace = "com.imaviso.stash"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.example.composeapp"
+        applicationId = "com.imaviso.stash"
         minSdk = 24
         targetSdk = 34
         versionCode = 1

@@ -1,4 +1,4 @@
-package com.example.composeapp.data.model
+package com.imaviso.stash.data.model
 
 import java.util.UUID
 

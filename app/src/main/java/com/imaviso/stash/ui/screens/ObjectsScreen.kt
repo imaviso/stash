@@ -1,4 +1,4 @@
-package com.example.composeapp.ui.screens
+package com.imaviso.stash.ui.screens
 
 import android.content.ContentResolver
 import android.content.Context
@@ -53,12 +53,12 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
-import com.example.composeapp.data.model.FileType
-import com.example.composeapp.data.model.S3Object
-import com.example.composeapp.ui.viewmodel.ClipboardAction
-import com.example.composeapp.ui.viewmodel.ObjectsViewModel
-import com.example.composeapp.ui.viewmodel.SortOption
-import com.example.composeapp.ui.viewmodel.ViewMode
+import com.imaviso.stash.data.model.FileType
+import com.imaviso.stash.data.model.S3Object
+import com.imaviso.stash.ui.viewmodel.ClipboardAction
+import com.imaviso.stash.ui.viewmodel.ObjectsViewModel
+import com.imaviso.stash.ui.viewmodel.SortOption
+import com.imaviso.stash.ui.viewmodel.ViewMode
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
@@ -600,7 +600,7 @@ fun ObjectsScreen(
 
 @Composable
 private fun ClipboardIndicator(
-    clipboard: com.example.composeapp.ui.viewmodel.ClipboardData,
+    clipboard: com.imaviso.stash.ui.viewmodel.ClipboardData,
     onClear: () -> Unit,
     modifier: Modifier = Modifier
 ) {

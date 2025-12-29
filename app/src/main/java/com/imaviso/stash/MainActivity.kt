@@ -1,4 +1,4 @@
-package com.example.composeapp
+package com.imaviso.stash
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -9,8 +9,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
 import androidx.navigation.compose.rememberNavController
-import com.example.composeapp.ui.navigation.S3NavHost
-import com.example.composeapp.ui.theme.ComposeAppTheme
+import com.imaviso.stash.ui.navigation.S3NavHost
+import com.imaviso.stash.ui.theme.ComposeAppTheme
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {

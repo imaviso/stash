@@ -1,4 +1,4 @@
-package com.example.composeapp.ui.screens
+package com.imaviso.stash.ui.screens
 
 import android.content.Context
 import android.content.Intent
@@ -31,8 +31,8 @@ import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import coil.compose.AsyncImagePainter
 import coil.request.ImageRequest
-import com.example.composeapp.data.model.FileType
-import com.example.composeapp.data.model.S3Object
+import com.imaviso.stash.data.model.FileType
+import com.imaviso.stash.data.model.S3Object
 import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)

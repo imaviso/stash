@@ -1,4 +1,4 @@
-package com.example.composeapp.ui.screens
+package com.imaviso.stash.ui.screens
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -24,7 +24,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import com.example.composeapp.ui.theme.ComposeAppTheme
+import com.imaviso.stash.ui.theme.ComposeAppTheme
 
 @Composable
 fun HomeScreen(modifier: Modifier = Modifier) {

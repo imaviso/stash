@@ -1,4 +1,4 @@
-package com.example.composeapp.data.repository
+package com.imaviso.stash.data.repository
 
 import android.content.Context
 import androidx.datastore.core.DataStore
@@ -7,8 +7,8 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
-import com.example.composeapp.data.model.S3Account
-import com.example.composeapp.data.model.S3Config
+import com.imaviso.stash.data.model.S3Account
+import com.imaviso.stash.data.model.S3Config
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import org.json.JSONArray

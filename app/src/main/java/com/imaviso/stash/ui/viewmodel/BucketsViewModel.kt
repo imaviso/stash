@@ -1,13 +1,13 @@
-package com.example.composeapp.ui.viewmodel
+package com.imaviso.stash.ui.viewmodel
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.composeapp.data.model.S3Account
-import com.example.composeapp.data.model.S3Bucket
-import com.example.composeapp.data.model.S3Config
-import com.example.composeapp.data.remote.S3Service
-import com.example.composeapp.data.repository.ConfigRepository
+import com.imaviso.stash.data.model.S3Account
+import com.imaviso.stash.data.model.S3Bucket
+import com.imaviso.stash.data.model.S3Config
+import com.imaviso.stash.data.remote.S3Service
+import com.imaviso.stash.data.repository.ConfigRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow

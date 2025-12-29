@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "ComposeApp"
+rootProject.name = "Stash"
 include(":app")
