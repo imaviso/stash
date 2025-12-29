@@ -530,15 +530,16 @@ class S3Service {
         val accessKey = config.accessKey
         val secretKey = config.secretKey
 
-        val now = java.time.Instant.now()
+        // Use SimpleDateFormat for API 24 compatibility
+        val now = java.util.Date()
         val dateTimeFormat =
-            java.time.format.DateTimeFormatter
-                .ofPattern("yyyyMMdd'T'HHmmss'Z'")
-                .withZone(java.time.ZoneOffset.UTC)
+            java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'", java.util.Locale.US).apply {
+                timeZone = java.util.TimeZone.getTimeZone("UTC")
+            }
         val dateFormat =
-            java.time.format.DateTimeFormatter
-                .ofPattern("yyyyMMdd")
-                .withZone(java.time.ZoneOffset.UTC)
+            java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US).apply {
+                timeZone = java.util.TimeZone.getTimeZone("UTC")
+            }
 
         val amzDate = dateTimeFormat.format(now)
         val dateStamp = dateFormat.format(now)
