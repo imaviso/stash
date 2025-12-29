@@ -1,7 +1,9 @@
 package com.imaviso.stash.worker
 
 import android.content.Context
+import android.content.pm.ServiceInfo
 import android.net.Uri
+import android.os.Build
 import android.util.Log
 import androidx.work.CoroutineWorker
 import androidx.work.Data
@@ -200,9 +202,17 @@ class UploadWorker(
                     isIndeterminate = progress == 0,
                 ).build()
 
-        return ForegroundInfo(
-            TransferNotificationManager.UPLOAD_NOTIFICATION_ID,
-            notification,
-        )
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ForegroundInfo(
+                TransferNotificationManager.UPLOAD_NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+            )
+        } else {
+            ForegroundInfo(
+                TransferNotificationManager.UPLOAD_NOTIFICATION_ID,
+                notification,
+            )
+        }
     }
 }

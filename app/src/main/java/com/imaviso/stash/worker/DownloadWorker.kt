@@ -2,6 +2,7 @@ package com.imaviso.stash.worker
 
 import android.content.ContentValues
 import android.content.Context
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
@@ -287,10 +288,18 @@ class DownloadWorker(
                     isIndeterminate = progress == 0,
                 ).build()
 
-        return ForegroundInfo(
-            TransferNotificationManager.DOWNLOAD_NOTIFICATION_ID,
-            notification,
-        )
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ForegroundInfo(
+                TransferNotificationManager.DOWNLOAD_NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+            )
+        } else {
+            ForegroundInfo(
+                TransferNotificationManager.DOWNLOAD_NOTIFICATION_ID,
+                notification,
+            )
+        }
     }
 
     // Manual presigned URL generation for path-style access (Garage, MinIO, etc.)
