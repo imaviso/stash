@@ -1,5 +1,7 @@
 package com.imaviso.stash.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
@@ -10,7 +12,6 @@ import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
@@ -47,8 +48,10 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -59,8 +62,11 @@ import coil.request.ImageRequest
 import com.imaviso.stash.data.model.FileType
 import com.imaviso.stash.data.model.S3Object
 import com.imaviso.stash.ui.viewmodel.ClipboardAction
+import com.imaviso.stash.ui.viewmodel.FileTypeStats
 import com.imaviso.stash.ui.viewmodel.ObjectsViewModel
+import com.imaviso.stash.ui.viewmodel.ShareExpiration
 import com.imaviso.stash.ui.viewmodel.SortOption
+import com.imaviso.stash.ui.viewmodel.StorageStats
 import com.imaviso.stash.ui.viewmodel.TransferType
 import com.imaviso.stash.ui.viewmodel.ViewMode
 import kotlinx.coroutines.FlowPreview
@@ -120,13 +126,13 @@ fun ObjectsScreen(
             onRefresh = viewModel::refresh,
         )
 
-    // File picker launcher
+    // File picker launcher - supports multiple file selection
     val filePickerLauncher =
         rememberLauncherForActivityResult(
-            contract = ActivityResultContracts.GetContent(),
-        ) { uri: Uri? ->
-            uri?.let {
-                handleFileUpload(context, it, viewModel)
+            contract = ActivityResultContracts.OpenMultipleDocuments(),
+        ) { uris: List<Uri> ->
+            uris.forEach { uri ->
+                handleFileUpload(context, uri, viewModel)
             }
         }
 
@@ -416,6 +422,28 @@ fun ObjectsScreen(
                         IconButton(onClick = { viewModel.toggleMultiSelectMode() }) {
                             Icon(Icons.Default.Checklist, contentDescription = "Multi-select")
                         }
+                        // More options menu (storage stats, etc.)
+                        var showMoreMenu by remember { mutableStateOf(false) }
+                        Box {
+                            IconButton(onClick = { showMoreMenu = true }) {
+                                Icon(Icons.Default.MoreVert, contentDescription = "More options")
+                            }
+                            DropdownMenu(
+                                expanded = showMoreMenu,
+                                onDismissRequest = { showMoreMenu = false },
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("Storage stats") },
+                                    onClick = {
+                                        showMoreMenu = false
+                                        viewModel.showStorageStats()
+                                    },
+                                    leadingIcon = {
+                                        Icon(Icons.Default.PieChart, contentDescription = null)
+                                    },
+                                )
+                            }
+                        }
                     },
                 )
             }
@@ -457,9 +485,12 @@ fun ObjectsScreen(
                 // Upload FAB
                 if (!uiState.isMultiSelectMode) {
                     FloatingActionButton(
-                        onClick = { filePickerLauncher.launch("*/*") },
+                        onClick = { filePickerLauncher.launch(arrayOf("*/*")) },
                     ) {
-                        Icon(Icons.Default.Upload, contentDescription = "Upload")
+                        Icon(
+                            imageVector = Icons.Default.Add,
+                            contentDescription = "Upload files",
+                        )
                     }
                 }
             }
@@ -515,10 +546,10 @@ fun ObjectsScreen(
                             verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
                             items(displayObjects) { obj ->
-                                // Load thumbnail URL for images
+                                // Load thumbnail URL for images and videos
                                 var thumbnailUrl by remember(obj.key) { mutableStateOf<String?>(null) }
                                 LaunchedEffect(obj.key) {
-                                    if (obj.fileType == FileType.IMAGE && !obj.isFolder) {
+                                    if ((obj.fileType == FileType.IMAGE || obj.fileType == FileType.VIDEO) && !obj.isFolder) {
                                         thumbnailUrl = viewModel.getThumbnailUrl(obj)
                                     }
                                 }
@@ -567,9 +598,16 @@ fun ObjectsScreen(
                                             openFileWithExternalApp(context, file, obj.mimeType)
                                         }
                                     },
+                                    onShare = { viewModel.showShareDialog(obj) },
                                     onRename = { viewModel.showRenameDialog(obj) },
                                     onDetails = { viewModel.showDetailsDialog(obj) },
                                     onDelete = { viewModel.showDeleteDialog(obj) },
+                                    onDownloadFolder =
+                                        if (obj.isFolder) {
+                                            { viewModel.downloadFolderRecursively(obj) }
+                                        } else {
+                                            null
+                                        },
                                 )
                             }
                         }
@@ -592,7 +630,7 @@ fun ObjectsScreen(
                             items(displayObjects) { obj ->
                                 var thumbnailUrl by remember(obj.key) { mutableStateOf<String?>(null) }
                                 LaunchedEffect(obj.key) {
-                                    if (obj.fileType == FileType.IMAGE && !obj.isFolder) {
+                                    if ((obj.fileType == FileType.IMAGE || obj.fileType == FileType.VIDEO) && !obj.isFolder) {
                                         thumbnailUrl = viewModel.getThumbnailUrl(obj)
                                     }
                                 }
@@ -688,12 +726,23 @@ fun ObjectsScreen(
                 isDeleting = uiState.isDeleting,
             )
         } else if (uiState.selectedObject != null) {
-            DeleteObjectDialog(
-                objectKey = uiState.selectedObject!!.key,
-                onConfirm = viewModel::deleteObject,
-                onDismiss = viewModel::hideDeleteDialog,
-                isDeleting = uiState.isDeleting,
-            )
+            // Check if it's a folder - use recursive delete dialog
+            if (uiState.selectedObject!!.isFolder) {
+                DeleteFolderDialog(
+                    folderName = uiState.selectedObject!!.fileName,
+                    isDeleting = uiState.isDeletingFolder,
+                    deleteProgress = uiState.folderDeleteProgress,
+                    onConfirm = { viewModel.deleteFolderRecursively(uiState.selectedObject!!) },
+                    onDismiss = viewModel::hideDeleteDialog,
+                )
+            } else {
+                DeleteObjectDialog(
+                    objectKey = uiState.selectedObject!!.key,
+                    onConfirm = viewModel::deleteObject,
+                    onDismiss = viewModel::hideDeleteDialog,
+                    isDeleting = uiState.isDeleting,
+                )
+            }
         }
     }
 
@@ -713,6 +762,47 @@ fun ObjectsScreen(
             onConfirm = { newName -> viewModel.renameObject(newName) },
             onDismiss = { viewModel.hideRenameDialog() },
             isRenaming = uiState.isRenaming,
+        )
+    }
+
+    // Share Link Dialog
+    if (uiState.showShareDialog && uiState.shareObject != null) {
+        ShareLinkDialog(
+            obj = uiState.shareObject!!,
+            shareUrl = uiState.shareUrl,
+            isGenerating = uiState.isGeneratingShareUrl,
+            onGenerateUrl = { expiration -> viewModel.generateShareUrl(expiration) },
+            onDismiss = { viewModel.hideShareDialog() },
+        )
+    }
+
+    // Storage Stats Dialog
+    if (uiState.showStorageStats) {
+        StorageStatsDialog(
+            stats = uiState.storageStats,
+            isLoading = uiState.isLoadingStats,
+            currentPrefix = uiState.currentPrefix,
+            onDismiss = { viewModel.hideStorageStats() },
+        )
+    }
+
+    // Folder Delete Progress Overlay
+    if (uiState.isDeletingFolder) {
+        ProgressOverlay(
+            message = uiState.folderDeleteProgress,
+            progress = null,
+            canCancel = false,
+            onCancel = {},
+        )
+    }
+
+    // Folder Download Progress Overlay
+    if (uiState.isDownloadingFolder) {
+        ProgressOverlay(
+            message = uiState.folderDownloadProgress,
+            progress = null,
+            canCancel = false,
+            onCancel = {},
         )
     }
 
@@ -826,9 +916,11 @@ private fun ObjectItem(
     onLongClick: () -> Unit,
     onDownload: () -> Unit,
     onOpenWith: () -> Unit,
+    onShare: () -> Unit,
     onRename: () -> Unit,
     onDetails: () -> Unit,
     onDelete: () -> Unit,
+    onDownloadFolder: (() -> Unit)? = null,
 ) {
     val dateFormat = remember { SimpleDateFormat("MMM dd, yyyy HH:mm", Locale.getDefault()) }
 
@@ -894,19 +986,38 @@ private fun ObjectItem(
                             .background(MaterialTheme.colorScheme.surfaceVariant),
                     contentAlignment = Alignment.Center,
                 ) {
-                    if (thumbnailUrl != null && obj.fileType == FileType.IMAGE) {
-                        AsyncImage(
-                            model =
-                                ImageRequest
-                                    .Builder(LocalContext.current)
-                                    .data(thumbnailUrl)
-                                    .crossfade(true)
-                                    .size(96) // Request small size for thumbnail
-                                    .build(),
-                            contentDescription = "Thumbnail",
-                            modifier = Modifier.fillMaxSize(),
-                            contentScale = ContentScale.Crop,
-                        )
+                    if (thumbnailUrl != null && (obj.fileType == FileType.IMAGE || obj.fileType == FileType.VIDEO)) {
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            AsyncImage(
+                                model =
+                                    ImageRequest
+                                        .Builder(LocalContext.current)
+                                        .data(thumbnailUrl)
+                                        .crossfade(true)
+                                        .size(96) // Request small size for thumbnail
+                                        .build(),
+                                contentDescription = "Thumbnail",
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Crop,
+                            )
+                            // Play icon overlay for videos
+                            if (obj.fileType == FileType.VIDEO) {
+                                Box(
+                                    modifier =
+                                        Modifier
+                                            .fillMaxSize()
+                                            .background(Color.Black.copy(alpha = 0.3f)),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.PlayCircle,
+                                        contentDescription = null,
+                                        tint = Color.White.copy(alpha = 0.9f),
+                                        modifier = Modifier.size(20.dp),
+                                    )
+                                }
+                            }
+                        }
                     } else {
                         Icon(
                             imageVector = getFileTypeIcon(obj),
@@ -949,7 +1060,7 @@ private fun ObjectItem(
             }
 
             // Action buttons (only shown when not in multi-select mode)
-            if (!isMultiSelectMode && !obj.isFolder) {
+            if (!isMultiSelectMode) {
                 // More options menu
                 var showMenu by remember { mutableStateOf(false) }
                 Box {
@@ -964,62 +1075,114 @@ private fun ObjectItem(
                         expanded = showMenu,
                         onDismissRequest = { showMenu = false },
                     ) {
-                        DropdownMenuItem(
-                            text = { Text("Open with") },
-                            onClick = {
-                                showMenu = false
-                                onOpenWith()
-                            },
-                            leadingIcon = {
-                                Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null)
-                            },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Download") },
-                            onClick = {
-                                showMenu = false
-                                onDownload()
-                            },
-                            leadingIcon = {
-                                Icon(Icons.Default.Download, contentDescription = null)
-                            },
-                        )
-                        HorizontalDivider()
-                        DropdownMenuItem(
-                            text = { Text("Rename") },
-                            onClick = {
-                                showMenu = false
-                                onRename()
-                            },
-                            leadingIcon = {
-                                Icon(Icons.Default.Edit, contentDescription = null)
-                            },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Details") },
-                            onClick = {
-                                showMenu = false
-                                onDetails()
-                            },
-                            leadingIcon = {
-                                Icon(Icons.Default.Info, contentDescription = null)
-                            },
-                        )
-                        HorizontalDivider()
-                        DropdownMenuItem(
-                            text = { Text("Delete") },
-                            onClick = {
-                                showMenu = false
-                                onDelete()
-                            },
-                            leadingIcon = {
-                                Icon(
-                                    Icons.Default.Delete,
-                                    contentDescription = null,
-                                    tint = MaterialTheme.colorScheme.error,
+                        if (obj.isFolder) {
+                            // Folder-specific actions
+                            if (onDownloadFolder != null) {
+                                DropdownMenuItem(
+                                    text = { Text("Download folder") },
+                                    onClick = {
+                                        showMenu = false
+                                        onDownloadFolder()
+                                    },
+                                    leadingIcon = {
+                                        Icon(Icons.Default.FolderZip, contentDescription = null)
+                                    },
                                 )
-                            },
-                        )
+                            }
+                            DropdownMenuItem(
+                                text = { Text("Details") },
+                                onClick = {
+                                    showMenu = false
+                                    onDetails()
+                                },
+                                leadingIcon = {
+                                    Icon(Icons.Default.Info, contentDescription = null)
+                                },
+                            )
+                            HorizontalDivider()
+                            DropdownMenuItem(
+                                text = { Text("Delete folder") },
+                                onClick = {
+                                    showMenu = false
+                                    onDelete()
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        Icons.Default.DeleteForever,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.error,
+                                    )
+                                },
+                            )
+                        } else {
+                            // File-specific actions
+                            DropdownMenuItem(
+                                text = { Text("Share link") },
+                                onClick = {
+                                    showMenu = false
+                                    onShare()
+                                },
+                                leadingIcon = {
+                                    Icon(Icons.Default.Share, contentDescription = null)
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Open with") },
+                                onClick = {
+                                    showMenu = false
+                                    onOpenWith()
+                                },
+                                leadingIcon = {
+                                    Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null)
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Download") },
+                                onClick = {
+                                    showMenu = false
+                                    onDownload()
+                                },
+                                leadingIcon = {
+                                    Icon(Icons.Default.Download, contentDescription = null)
+                                },
+                            )
+                            HorizontalDivider()
+                            DropdownMenuItem(
+                                text = { Text("Rename") },
+                                onClick = {
+                                    showMenu = false
+                                    onRename()
+                                },
+                                leadingIcon = {
+                                    Icon(Icons.Default.Edit, contentDescription = null)
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Details") },
+                                onClick = {
+                                    showMenu = false
+                                    onDetails()
+                                },
+                                leadingIcon = {
+                                    Icon(Icons.Default.Info, contentDescription = null)
+                                },
+                            )
+                            HorizontalDivider()
+                            DropdownMenuItem(
+                                text = { Text("Delete") },
+                                onClick = {
+                                    showMenu = false
+                                    onDelete()
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        Icons.Default.Delete,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.error,
+                                    )
+                                },
+                            )
+                        }
                     }
                 }
             }
@@ -1509,19 +1672,38 @@ private fun ObjectGridItem(
                             .background(MaterialTheme.colorScheme.surfaceVariant),
                     contentAlignment = Alignment.Center,
                 ) {
-                    if (thumbnailUrl != null && obj.fileType == FileType.IMAGE) {
-                        AsyncImage(
-                            model =
-                                ImageRequest
-                                    .Builder(LocalContext.current)
-                                    .data(thumbnailUrl)
-                                    .crossfade(true)
-                                    .size(200)
-                                    .build(),
-                            contentDescription = "Thumbnail",
-                            modifier = Modifier.fillMaxSize(),
-                            contentScale = ContentScale.Crop,
-                        )
+                    if (thumbnailUrl != null && (obj.fileType == FileType.IMAGE || obj.fileType == FileType.VIDEO)) {
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            AsyncImage(
+                                model =
+                                    ImageRequest
+                                        .Builder(LocalContext.current)
+                                        .data(thumbnailUrl)
+                                        .crossfade(true)
+                                        .size(200) // Request size for grid thumbnail
+                                        .build(),
+                                contentDescription = "Thumbnail",
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Crop,
+                            )
+                            // Play icon overlay for videos
+                            if (obj.fileType == FileType.VIDEO) {
+                                Box(
+                                    modifier =
+                                        Modifier
+                                            .fillMaxSize()
+                                            .background(Color.Black.copy(alpha = 0.3f)),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.PlayCircle,
+                                        contentDescription = null,
+                                        tint = Color.White.copy(alpha = 0.9f),
+                                        modifier = Modifier.size(32.dp),
+                                    )
+                                }
+                            }
+                        }
                     } else {
                         Icon(
                             imageVector = getFileTypeIcon(obj),
@@ -1870,3 +2052,397 @@ private fun formatTransferBytes(bytes: Long): String =
         bytes < 1024 * 1024 * 1024 -> "%.1f MB".format(bytes / (1024f * 1024f))
         else -> "%.1f GB".format(bytes / (1024f * 1024f * 1024f))
     }
+
+// ==================== SHARE DIALOG ====================
+
+@Composable
+private fun ShareLinkDialog(
+    obj: S3Object,
+    shareUrl: String?,
+    isGenerating: Boolean,
+    onGenerateUrl: (ShareExpiration) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    val clipboardManager = LocalClipboardManager.current
+    var selectedExpiration by remember { mutableStateOf(ShareExpiration.ONE_DAY) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Share Link") },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                Text(
+                    text = obj.fileName,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                )
+
+                Text(
+                    text = "Link expires after:",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+
+                // Expiration options
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    ShareExpiration.entries.take(2).forEach { expiration ->
+                        FilterChip(
+                            selected = selectedExpiration == expiration,
+                            onClick = { selectedExpiration = expiration },
+                            label = { Text(expiration.displayName) },
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    ShareExpiration.entries.drop(2).forEach { expiration ->
+                        FilterChip(
+                            selected = selectedExpiration == expiration,
+                            onClick = { selectedExpiration = expiration },
+                            label = { Text(expiration.displayName) },
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                }
+
+                if (shareUrl != null) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors =
+                            CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                            ),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                        ) {
+                            Text(
+                                text = shareUrl,
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 3,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                OutlinedButton(
+                                    onClick = {
+                                        clipboardManager.setText(AnnotatedString(shareUrl))
+                                        Toast.makeText(context, "Link copied!", Toast.LENGTH_SHORT).show()
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Icon(
+                                        Icons.Default.ContentCopy,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Copy")
+                                }
+                                Button(
+                                    onClick = {
+                                        val shareIntent =
+                                            Intent(Intent.ACTION_SEND).apply {
+                                                type = "text/plain"
+                                                putExtra(Intent.EXTRA_TEXT, shareUrl)
+                                                putExtra(Intent.EXTRA_SUBJECT, obj.fileName)
+                                            }
+                                        context.startActivity(Intent.createChooser(shareIntent, "Share via"))
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Icon(
+                                        Icons.Default.Share,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Share")
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (isGenerating) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Center,
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Generating link...")
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            if (shareUrl == null) {
+                Button(
+                    onClick = { onGenerateUrl(selectedExpiration) },
+                    enabled = !isGenerating,
+                ) {
+                    Text("Generate Link")
+                }
+            } else {
+                TextButton(onClick = onDismiss) {
+                    Text("Done")
+                }
+            }
+        },
+        dismissButton = {
+            if (shareUrl == null) {
+                TextButton(onClick = onDismiss) {
+                    Text("Cancel")
+                }
+            }
+        },
+    )
+}
+
+// ==================== STORAGE STATS DIALOG ====================
+
+@Composable
+private fun StorageStatsDialog(
+    stats: StorageStats?,
+    isLoading: Boolean,
+    currentPrefix: String,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                if (currentPrefix.isEmpty()) "Bucket Storage" else "Folder Storage",
+            )
+        },
+        text = {
+            if (isLoading) {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    CircularProgressIndicator()
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text("Calculating storage...")
+                }
+            } else if (stats != null) {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    // Summary card
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors =
+                            CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.primaryContainer,
+                            ),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(16.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            Text(
+                                text = stats.formattedTotalSize,
+                                style = MaterialTheme.typography.headlineMedium,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            )
+                            Text(
+                                text = "${stats.fileCount} files, ${stats.folderCount} folders",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f),
+                            )
+                        }
+                    }
+
+                    // Breakdown by file type
+                    if (stats.byFileType.isNotEmpty()) {
+                        Text(
+                            text = "By File Type",
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        stats.byFileType
+                            .toList()
+                            .sortedByDescending { it.second.totalSize }
+                            .forEach { (fileType, typeStats) ->
+                                FileTypeStatRow(fileType, typeStats, stats.totalSize)
+                            }
+                    }
+                }
+            } else {
+                Text("No data available")
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Close")
+            }
+        },
+    )
+}
+
+@Composable
+private fun FileTypeStatRow(
+    fileType: FileType,
+    stats: FileTypeStats,
+    totalSize: Long,
+) {
+    val percentage = if (totalSize > 0) (stats.totalSize.toFloat() / totalSize * 100) else 0f
+    val icon =
+        when (fileType) {
+            FileType.IMAGE -> Icons.Default.Image
+            FileType.VIDEO -> Icons.Default.VideoFile
+            FileType.AUDIO -> Icons.Default.AudioFile
+            FileType.TEXT -> Icons.Default.Description
+            FileType.PDF -> Icons.Default.PictureAsPdf
+            FileType.OTHER -> Icons.AutoMirrored.Filled.InsertDriveFile
+        }
+    val color =
+        when (fileType) {
+            FileType.IMAGE -> Color(0xFF4CAF50)
+            FileType.VIDEO -> Color(0xFFF44336)
+            FileType.AUDIO -> Color(0xFF9C27B0)
+            FileType.TEXT -> Color(0xFF2196F3)
+            FileType.PDF -> Color(0xFFFF5722)
+            FileType.OTHER -> Color(0xFF607D8B)
+        }
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = color,
+            modifier = Modifier.size(24.dp),
+        )
+        Spacer(modifier = Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    text = fileType.name.lowercase().replaceFirstChar { it.uppercase() },
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    text = "${stats.count} files",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            LinearProgressIndicator(
+                progress = { percentage / 100f },
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(3.dp)),
+                color = color,
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = "${stats.formattedSize} (${String.format("%.1f", percentage)}%)",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+// ==================== DELETE FOLDER DIALOG ====================
+
+@Composable
+private fun DeleteFolderDialog(
+    folderName: String,
+    isDeleting: Boolean,
+    deleteProgress: String,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = { if (!isDeleting) onDismiss() },
+        title = { Text("Delete Folder") },
+        text = {
+            Column {
+                if (isDeleting) {
+                    Text(deleteProgress)
+                    Spacer(modifier = Modifier.height(16.dp))
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                } else {
+                    Text(
+                        "Are you sure you want to delete '$folderName' and ALL its contents? " +
+                            "This action cannot be undone.",
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Card(
+                        colors =
+                            CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.errorContainer,
+                            ),
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.error,
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                "This will delete all files and subfolders!",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onConfirm,
+                enabled = !isDeleting,
+                colors =
+                    ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                    ),
+            ) {
+                if (isDeleting) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onError,
+                    )
+                } else {
+                    Text("Delete All")
+                }
+            }
+        },
+        dismissButton = {
+            if (!isDeleting) {
+                TextButton(onClick = onDismiss) {
+                    Text("Cancel")
+                }
+            }
+        },
+    )
+}

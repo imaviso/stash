@@ -28,49 +28,44 @@ import java.util.*
 fun BucketsScreen(
     onNavigateToConfig: () -> Unit,
     onNavigateToBucket: (String) -> Unit,
-    viewModel: BucketsViewModel = viewModel()
+    viewModel: BucketsViewModel = viewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
-    
-    val pullRefreshState = rememberPullRefreshState(
-        refreshing = uiState.isLoading,
-        onRefresh = viewModel::refresh
-    )
-    
+
+    val pullRefreshState =
+        rememberPullRefreshState(
+            refreshing = uiState.isLoading,
+            onRefresh = viewModel::refresh,
+        )
+
     LaunchedEffect(uiState.error) {
         uiState.error?.let { error ->
             snackbarHostState.showSnackbar(error)
             viewModel.clearError()
         }
     }
-    
+
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { 
+                title = {
                     Column {
                         Text("S3 Buckets")
                         uiState.activeAccount?.let { account ->
                             Text(
                                 text = account.name,
                                 style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
                     }
                 },
                 actions = {
-                    // Account switcher (only show if multiple accounts)
-                    if (uiState.accounts.size > 1) {
-                        IconButton(onClick = { viewModel.showAccountPicker() }) {
-                            Icon(Icons.Default.SwitchAccount, contentDescription = "Switch account")
-                        }
-                    }
                     IconButton(onClick = onNavigateToConfig) {
                         Icon(Icons.Default.Settings, contentDescription = "Settings")
                     }
-                }
+                },
             )
         },
         floatingActionButton = {
@@ -80,56 +75,49 @@ fun BucketsScreen(
                 }
             }
         },
-        snackbarHost = { SnackbarHost(snackbarHostState) }
+        snackbarHost = { SnackbarHost(snackbarHostState) },
     ) { padding ->
         Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .pullRefresh(pullRefreshState)
+            modifier =
+                Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+                    .pullRefresh(pullRefreshState),
         ) {
             when {
                 !uiState.isConfigured -> {
                     NotConfiguredView(onNavigateToConfig)
                 }
+
                 uiState.buckets.isEmpty() && !uiState.isLoading -> {
                     EmptyBucketsView()
                 }
+
                 else -> {
                     LazyColumn(
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         items(uiState.buckets) { bucket ->
                             BucketItem(
                                 bucket = bucket,
                                 onClick = { onNavigateToBucket(bucket.name) },
-                                onDelete = { viewModel.showDeleteDialog(bucket) }
+                                onDelete = { viewModel.showDeleteDialog(bucket) },
                             )
                         }
                     }
                 }
             }
-            
+
             PullRefreshIndicator(
                 refreshing = uiState.isLoading,
                 state = pullRefreshState,
-                modifier = Modifier.align(Alignment.TopCenter)
+                modifier = Modifier.align(Alignment.TopCenter),
             )
         }
     }
-    
-    // Account Picker Dialog
-    if (uiState.showAccountPicker) {
-        AccountPickerDialog(
-            accounts = uiState.accounts,
-            activeAccountId = uiState.activeAccount?.id,
-            onSelectAccount = { viewModel.switchAccount(it) },
-            onDismiss = { viewModel.hideAccountPicker() }
-        )
-    }
-    
+
     // Create Bucket Dialog
     if (uiState.showCreateDialog) {
         CreateBucketDialog(
@@ -137,17 +125,17 @@ fun BucketsScreen(
             onBucketNameChange = viewModel::updateNewBucketName,
             onConfirm = viewModel::createBucket,
             onDismiss = viewModel::hideCreateDialog,
-            isCreating = uiState.isCreating
+            isCreating = uiState.isCreating,
         )
     }
-    
+
     // Delete Bucket Dialog
     if (uiState.showDeleteDialog && uiState.selectedBucket != null) {
         DeleteBucketDialog(
             bucketName = uiState.selectedBucket!!.name,
             onConfirm = viewModel::deleteBucket,
             onDismiss = viewModel::hideDeleteDialog,
-            isDeleting = uiState.isDeleting
+            isDeleting = uiState.isDeleting,
         )
     }
 }
@@ -157,56 +145,65 @@ private fun AccountPickerDialog(
     accounts: List<S3Account>,
     activeAccountId: String?,
     onSelectAccount: (S3Account) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Switch Account") },
         text = {
             LazyColumn(
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+                verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 items(accounts) { account ->
                     val isActive = account.id == activeAccountId
-                    val contentColor = if (isActive)
-                        MaterialTheme.colorScheme.onPrimaryContainer
-                    else
-                        MaterialTheme.colorScheme.onSurface
-                    val secondaryContentColor = if (isActive)
-                        MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f)
-                    else
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    
+                    val contentColor =
+                        if (isActive) {
+                            MaterialTheme.colorScheme.onPrimaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        }
+                    val secondaryContentColor =
+                        if (isActive) {
+                            MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f)
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+
                     Card(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onSelectAccount(account) },
-                        colors = CardDefaults.cardColors(
-                            containerColor = if (isActive)
-                                MaterialTheme.colorScheme.primaryContainer
-                            else
-                                MaterialTheme.colorScheme.surface
-                        )
+                        modifier =
+                            Modifier
+                                .fillMaxWidth()
+                                .clickable { onSelectAccount(account) },
+                        colors =
+                            CardDefaults.cardColors(
+                                containerColor =
+                                    if (isActive) {
+                                        MaterialTheme.colorScheme.primaryContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.surface
+                                    },
+                            ),
                     ) {
                         Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(12.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                            modifier =
+                                Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
                         ) {
                             if (isActive) {
                                 Icon(
                                     Icons.Default.CheckCircle,
                                     contentDescription = "Active",
                                     tint = contentColor,
-                                    modifier = Modifier.size(20.dp)
+                                    modifier = Modifier.size(20.dp),
                                 )
                             } else {
                                 Icon(
                                     Icons.Default.Cloud,
                                     contentDescription = null,
                                     tint = secondaryContentColor,
-                                    modifier = Modifier.size(20.dp)
+                                    modifier = Modifier.size(20.dp),
                                 )
                             }
                             Spacer(modifier = Modifier.width(12.dp))
@@ -214,14 +211,14 @@ private fun AccountPickerDialog(
                                 Text(
                                     text = account.name,
                                     style = MaterialTheme.typography.bodyLarge,
-                                    color = contentColor
+                                    color = contentColor,
                                 )
                                 Text(
                                     text = account.endpoint,
                                     style = MaterialTheme.typography.bodySmall,
                                     color = secondaryContentColor,
                                     maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
+                                    overflow = TextOverflow.Ellipsis,
                                 )
                             }
                         }
@@ -233,35 +230,36 @@ private fun AccountPickerDialog(
             TextButton(onClick = onDismiss) {
                 Text("Cancel")
             }
-        }
+        },
     )
 }
 
 @Composable
 private fun NotConfiguredView(onNavigateToConfig: () -> Unit) {
     Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(32.dp),
+        modifier =
+            Modifier
+                .fillMaxSize()
+                .padding(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+        verticalArrangement = Arrangement.Center,
     ) {
         Icon(
             imageVector = Icons.Default.CloudOff,
             contentDescription = null,
             modifier = Modifier.size(64.dp),
-            tint = MaterialTheme.colorScheme.onSurfaceVariant
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(modifier = Modifier.height(16.dp))
         Text(
             text = "S3 Not Configured",
-            style = MaterialTheme.typography.headlineSmall
+            style = MaterialTheme.typography.headlineSmall,
         )
         Spacer(modifier = Modifier.height(8.dp))
         Text(
             text = "Please configure your S3 credentials to get started",
             style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(modifier = Modifier.height(24.dp))
         Button(onClick = onNavigateToConfig) {
@@ -275,28 +273,29 @@ private fun NotConfiguredView(onNavigateToConfig: () -> Unit) {
 @Composable
 private fun EmptyBucketsView() {
     Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(32.dp),
+        modifier =
+            Modifier
+                .fillMaxSize()
+                .padding(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+        verticalArrangement = Arrangement.Center,
     ) {
         Icon(
             imageVector = Icons.Default.FolderOpen,
             contentDescription = null,
             modifier = Modifier.size(64.dp),
-            tint = MaterialTheme.colorScheme.onSurfaceVariant
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(modifier = Modifier.height(16.dp))
         Text(
             text = "No Buckets",
-            style = MaterialTheme.typography.headlineSmall
+            style = MaterialTheme.typography.headlineSmall,
         )
         Spacer(modifier = Modifier.height(8.dp))
         Text(
             text = "Tap + to create your first bucket",
             style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
@@ -305,30 +304,32 @@ private fun EmptyBucketsView() {
 private fun BucketItem(
     bucket: S3Bucket,
     onClick: () -> Unit,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
 ) {
     val dateFormat = remember { SimpleDateFormat("MMM dd, yyyy", Locale.getDefault()) }
-    
+
     Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick)
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onClick),
     ) {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+            verticalAlignment = Alignment.CenterVertically,
         ) {
             Row(
                 modifier = Modifier.weight(1f),
-                verticalAlignment = Alignment.CenterVertically
+                verticalAlignment = Alignment.CenterVertically,
             ) {
                 Icon(
                     imageVector = Icons.Default.Storage,
                     contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary
+                    tint = MaterialTheme.colorScheme.primary,
                 )
                 Spacer(modifier = Modifier.width(12.dp))
                 Column {
@@ -336,13 +337,13 @@ private fun BucketItem(
                         text = bucket.name,
                         style = MaterialTheme.typography.titleMedium,
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        overflow = TextOverflow.Ellipsis,
                     )
                     bucket.creationDate?.let { date ->
                         Text(
                             text = "Created ${dateFormat.format(date)}",
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                 }
@@ -351,7 +352,7 @@ private fun BucketItem(
                 Icon(
                     imageVector = Icons.Default.Delete,
                     contentDescription = "Delete",
-                    tint = MaterialTheme.colorScheme.error
+                    tint = MaterialTheme.colorScheme.error,
                 )
             }
         }
@@ -364,7 +365,7 @@ private fun CreateBucketDialog(
     onBucketNameChange: (String) -> Unit,
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
-    isCreating: Boolean
+    isCreating: Boolean,
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -376,18 +377,18 @@ private fun CreateBucketDialog(
                 label = { Text("Bucket Name") },
                 placeholder = { Text("my-bucket") },
                 singleLine = true,
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
             )
         },
         confirmButton = {
             Button(
                 onClick = onConfirm,
-                enabled = bucketName.isNotBlank() && !isCreating
+                enabled = bucketName.isNotBlank() && !isCreating,
             ) {
                 if (isCreating) {
                     CircularProgressIndicator(
                         modifier = Modifier.size(16.dp),
-                        strokeWidth = 2.dp
+                        strokeWidth = 2.dp,
                     )
                 } else {
                     Text("Create")
@@ -398,7 +399,7 @@ private fun CreateBucketDialog(
             TextButton(onClick = onDismiss) {
                 Text("Cancel")
             }
-        }
+        },
     )
 }
 
@@ -407,7 +408,7 @@ private fun DeleteBucketDialog(
     bucketName: String,
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
-    isDeleting: Boolean
+    isDeleting: Boolean,
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -419,15 +420,16 @@ private fun DeleteBucketDialog(
             Button(
                 onClick = onConfirm,
                 enabled = !isDeleting,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.error
-                )
+                colors =
+                    ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                    ),
             ) {
                 if (isDeleting) {
                     CircularProgressIndicator(
                         modifier = Modifier.size(16.dp),
                         strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.onError
+                        color = MaterialTheme.colorScheme.onError,
                     )
                 } else {
                     Text("Delete")
@@ -438,6 +440,6 @@ private fun DeleteBucketDialog(
             TextButton(onClick = onDismiss) {
                 Text("Cancel")
             }
-        }
+        },
     )
 }

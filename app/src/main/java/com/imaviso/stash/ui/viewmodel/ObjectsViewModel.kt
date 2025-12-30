@@ -23,6 +23,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.days
+import kotlin.time.Duration.Companion.hours
 
 enum class ClipboardAction {
     COPY,
@@ -69,6 +72,52 @@ data class TransferInfo(
     val status: String = "",
     val error: String? = null,
 )
+
+/**
+ * Share URL expiration options
+ */
+enum class ShareExpiration(
+    val displayName: String,
+    val duration: Duration,
+) {
+    ONE_HOUR("1 hour", 1.hours),
+    SIX_HOURS("6 hours", 6.hours),
+    ONE_DAY("1 day", 1.days),
+    SEVEN_DAYS("7 days", 7.days),
+}
+
+/**
+ * Storage statistics for a bucket or folder
+ */
+data class StorageStats(
+    val totalSize: Long,
+    val fileCount: Int,
+    val folderCount: Int,
+    val byFileType: Map<FileType, FileTypeStats>,
+) {
+    val formattedTotalSize: String
+        get() =
+            when {
+                totalSize < 1024 -> "$totalSize B"
+                totalSize < 1024 * 1024 -> "%.1f KB".format(totalSize / 1024f)
+                totalSize < 1024 * 1024 * 1024 -> "%.1f MB".format(totalSize / (1024f * 1024f))
+                else -> "%.2f GB".format(totalSize / (1024f * 1024f * 1024f))
+            }
+}
+
+data class FileTypeStats(
+    val count: Int,
+    val totalSize: Long,
+) {
+    val formattedSize: String
+        get() =
+            when {
+                totalSize < 1024 -> "$totalSize B"
+                totalSize < 1024 * 1024 -> "%.1f KB".format(totalSize / 1024f)
+                totalSize < 1024 * 1024 * 1024 -> "%.1f MB".format(totalSize / (1024f * 1024f))
+                else -> "%.2f GB".format(totalSize / (1024f * 1024f * 1024f))
+            }
+}
 
 data class ObjectsUiState(
     val bucketName: String = "",
@@ -128,6 +177,20 @@ data class ObjectsUiState(
     // File details dialog
     val showDetailsDialog: Boolean = false,
     val detailsObject: S3Object? = null,
+    // Share dialog
+    val showShareDialog: Boolean = false,
+    val shareObject: S3Object? = null,
+    val shareUrl: String? = null,
+    val isGeneratingShareUrl: Boolean = false,
+    // Folder operations
+    val isDeletingFolder: Boolean = false,
+    val folderDeleteProgress: String = "",
+    val isDownloadingFolder: Boolean = false,
+    val folderDownloadProgress: String = "",
+    // Storage stats
+    val showStorageStats: Boolean = false,
+    val storageStats: StorageStats? = null,
+    val isLoadingStats: Boolean = false,
 )
 
 class ObjectsViewModel(
@@ -1232,11 +1295,11 @@ class ObjectsViewModel(
     private val thumbnailUrlCache = mutableMapOf<String, String>()
 
     /**
-     * Get a presigned URL for a thumbnail image.
+     * Get a presigned URL for a thumbnail (images and videos).
      * Results are cached to avoid regenerating URLs.
      */
     suspend fun getThumbnailUrl(obj: S3Object): String? {
-        if (obj.fileType != FileType.IMAGE) return null
+        if (obj.fileType != FileType.IMAGE && obj.fileType != FileType.VIDEO) return null
 
         // Check cache first
         thumbnailUrlCache[obj.key]?.let { return it }
@@ -1405,6 +1468,311 @@ class ObjectsViewModel(
 
     fun clearError() {
         _uiState.value = _uiState.value.copy(error = null)
+    }
+
+    // ==================== SHARE URL ====================
+
+    fun showShareDialog(obj: S3Object) {
+        _uiState.value =
+            _uiState.value.copy(
+                showShareDialog = true,
+                shareObject = obj,
+                shareUrl = null,
+            )
+    }
+
+    fun hideShareDialog() {
+        _uiState.value =
+            _uiState.value.copy(
+                showShareDialog = false,
+                shareObject = null,
+                shareUrl = null,
+                isGeneratingShareUrl = false,
+            )
+    }
+
+    fun generateShareUrl(expiration: ShareExpiration) {
+        val obj = _uiState.value.shareObject ?: return
+
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(isGeneratingShareUrl = true)
+
+            s3Service
+                .generateShareableUrl(
+                    bucketName = _uiState.value.bucketName,
+                    key = obj.key,
+                    expiresIn = expiration.duration,
+                ).onSuccess { url ->
+                    _uiState.value =
+                        _uiState.value.copy(
+                            shareUrl = url,
+                            isGeneratingShareUrl = false,
+                        )
+                }.onFailure { e ->
+                    _uiState.value =
+                        _uiState.value.copy(
+                            isGeneratingShareUrl = false,
+                            error = "Failed to generate share URL: ${e.message}",
+                        )
+                }
+        }
+    }
+
+    // ==================== RECURSIVE FOLDER DELETE ====================
+
+    fun deleteFolderRecursively(folder: S3Object) {
+        if (!folder.isFolder) return
+
+        viewModelScope.launch {
+            _uiState.value =
+                _uiState.value.copy(
+                    isDeletingFolder = true,
+                    folderDeleteProgress = "Scanning folder contents...",
+                )
+
+            // List all objects under this folder
+            s3Service
+                .listObjectsRecursive(_uiState.value.bucketName, folder.key)
+                .onSuccess { objects ->
+                    if (objects.isEmpty()) {
+                        // Just delete the folder marker
+                        s3Service.deleteObject(_uiState.value.bucketName, folder.key)
+                        _uiState.value =
+                            _uiState.value.copy(
+                                isDeletingFolder = false,
+                                folderDeleteProgress = "",
+                                showDeleteDialog = false,
+                            )
+                        loadObjects()
+                        return@onSuccess
+                    }
+
+                    // Delete in batches of 1000 (S3 limit)
+                    val totalCount = objects.size
+                    var deletedCount = 0
+
+                    objects.chunked(1000).forEach { batch ->
+                        _uiState.value =
+                            _uiState.value.copy(
+                                folderDeleteProgress = "Deleting $deletedCount of $totalCount objects...",
+                            )
+
+                        val keys = batch.map { it.key }
+                        s3Service.deleteObjects(_uiState.value.bucketName, keys)
+                        deletedCount += batch.size
+                    }
+
+                    // Also delete the folder marker itself
+                    s3Service.deleteObject(_uiState.value.bucketName, folder.key)
+
+                    _uiState.value =
+                        _uiState.value.copy(
+                            isDeletingFolder = false,
+                            folderDeleteProgress = "",
+                            showDeleteDialog = false,
+                            selectedObject = null,
+                        )
+                    loadObjects()
+                }.onFailure { e ->
+                    _uiState.value =
+                        _uiState.value.copy(
+                            isDeletingFolder = false,
+                            folderDeleteProgress = "",
+                            error = "Failed to delete folder: ${e.message}",
+                        )
+                }
+        }
+    }
+
+    // ==================== RECURSIVE FOLDER DOWNLOAD ====================
+
+    fun downloadFolderRecursively(folder: S3Object) {
+        if (!folder.isFolder) return
+
+        val transferId =
+            java.util.UUID
+                .randomUUID()
+                .toString()
+        val folderName = folder.fileName.trimEnd('/')
+
+        viewModelScope.launch {
+            _uiState.value =
+                _uiState.value.copy(
+                    isDownloadingFolder = true,
+                    folderDownloadProgress = "Scanning folder contents...",
+                )
+
+            // Add to active transfers
+            updateTransfer(
+                TransferInfo(
+                    id = transferId,
+                    fileName = folderName,
+                    type = TransferType.DOWNLOAD,
+                    status = "Scanning...",
+                ),
+            )
+
+            // List all objects under this folder
+            s3Service
+                .listObjectsRecursive(_uiState.value.bucketName, folder.key)
+                .onSuccess { objects ->
+                    val files = objects.filter { !it.key.endsWith("/") }
+                    if (files.isEmpty()) {
+                        _uiState.value =
+                            _uiState.value.copy(
+                                isDownloadingFolder = false,
+                                folderDownloadProgress = "",
+                                error = "Folder is empty",
+                            )
+                        removeTransfer(transferId)
+                        return@onSuccess
+                    }
+
+                    val totalFiles = files.size
+                    val totalSize = files.sumOf { it.size }
+                    var downloadedFiles = 0
+                    var downloadedBytes = 0L
+
+                    // Create base folder in Downloads
+                    val downloadsDir =
+                        android.os.Environment.getExternalStoragePublicDirectory(
+                            android.os.Environment.DIRECTORY_DOWNLOADS,
+                        )
+                    val baseFolderDir = java.io.File(downloadsDir, folderName)
+
+                    files.forEach { obj ->
+                        // Calculate relative path from folder root
+                        val relativePath = obj.key.removePrefix(folder.key)
+                        val destFile = java.io.File(baseFolderDir, relativePath)
+
+                        // Ensure parent directories exist
+                        destFile.parentFile?.mkdirs()
+
+                        _uiState.value =
+                            _uiState.value.copy(
+                                folderDownloadProgress = "Downloading ${downloadedFiles + 1} of $totalFiles...",
+                            )
+
+                        updateTransfer(
+                            TransferInfo(
+                                id = transferId,
+                                fileName = folderName,
+                                type = TransferType.DOWNLOAD,
+                                progress = ((downloadedBytes.toFloat() / totalSize) * 100).toInt(),
+                                bytesTransferred = downloadedBytes,
+                                totalBytes = totalSize,
+                                status = "Downloading ${downloadedFiles + 1}/$totalFiles",
+                            ),
+                        )
+
+                        s3Service
+                            .downloadObjectToFile(
+                                bucketName = _uiState.value.bucketName,
+                                key = obj.key,
+                                destFile = destFile,
+                                expectedSize = obj.size,
+                            ).onSuccess {
+                                downloadedFiles++
+                                downloadedBytes += obj.size
+                            }.onFailure { e ->
+                                // Log error but continue with other files
+                                android.util.Log.e("ObjectsViewModel", "Failed to download ${obj.key}: ${e.message}")
+                            }
+                    }
+
+                    _uiState.value =
+                        _uiState.value.copy(
+                            isDownloadingFolder = false,
+                            folderDownloadProgress = "",
+                        )
+                    removeTransfer(transferId)
+
+                    // Show success message
+                    if (downloadedFiles == totalFiles) {
+                        _uiState.value =
+                            _uiState.value.copy(
+                                error = "Downloaded $downloadedFiles files to Downloads/$folderName",
+                            )
+                    } else {
+                        _uiState.value =
+                            _uiState.value.copy(
+                                error = "Downloaded $downloadedFiles of $totalFiles files to Downloads/$folderName",
+                            )
+                    }
+                }.onFailure { e ->
+                    _uiState.value =
+                        _uiState.value.copy(
+                            isDownloadingFolder = false,
+                            folderDownloadProgress = "",
+                            error = "Failed to scan folder: ${e.message}",
+                        )
+                    removeTransfer(transferId)
+                }
+        }
+    }
+
+    // ==================== STORAGE STATS ====================
+
+    fun showStorageStats() {
+        _uiState.value = _uiState.value.copy(showStorageStats = true)
+        loadStorageStats()
+    }
+
+    fun hideStorageStats() {
+        _uiState.value =
+            _uiState.value.copy(
+                showStorageStats = false,
+                storageStats = null,
+            )
+    }
+
+    private fun loadStorageStats() {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(isLoadingStats = true)
+
+            // List all objects recursively in current prefix
+            s3Service
+                .listObjectsRecursive(_uiState.value.bucketName, _uiState.value.currentPrefix)
+                .onSuccess { objects ->
+                    val files = objects.filter { !it.key.endsWith("/") }
+                    val folders = objects.filter { it.key.endsWith("/") }
+
+                    // Group by file type
+                    val byType = mutableMapOf<FileType, MutableList<S3Object>>()
+                    files.forEach { obj ->
+                        val type = obj.fileType
+                        byType.getOrPut(type) { mutableListOf() }.add(obj)
+                    }
+
+                    val typeStats =
+                        byType.mapValues { (_, objs) ->
+                            FileTypeStats(
+                                count = objs.size,
+                                totalSize = objs.sumOf { it.size },
+                            )
+                        }
+
+                    val stats =
+                        StorageStats(
+                            totalSize = files.sumOf { it.size },
+                            fileCount = files.size,
+                            folderCount = folders.size,
+                            byFileType = typeStats,
+                        )
+
+                    _uiState.value =
+                        _uiState.value.copy(
+                            storageStats = stats,
+                            isLoadingStats = false,
+                        )
+                }.onFailure { e ->
+                    _uiState.value =
+                        _uiState.value.copy(
+                            isLoadingStats = false,
+                            error = "Failed to load stats: ${e.message}",
+                        )
+                }
+        }
     }
 
     // ==================== SCROLL STATE ====================

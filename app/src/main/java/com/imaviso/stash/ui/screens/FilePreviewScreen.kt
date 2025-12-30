@@ -2,12 +2,20 @@ package com.imaviso.stash.ui.screens
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.pdf.PdfRenderer
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import android.widget.Toast
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
@@ -22,6 +30,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -38,7 +47,9 @@ import coil.compose.AsyncImagePainter
 import coil.request.ImageRequest
 import com.imaviso.stash.data.model.FileType
 import com.imaviso.stash.data.model.S3Object
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
@@ -201,49 +212,93 @@ fun FilePreviewScreen(
                 }
             }
 
-            // Navigation buttons overlay (only show if more than one file)
+            // Navigation tap zones (only if more than one file)
             if (previewableObjects.size > 1) {
-                // Previous button
-                if (canGoBack) {
-                    IconButton(
-                        onClick = {
-                            coroutineScope.launch {
-                                pagerState.animateScrollToPage(currentIndex - 1)
-                            }
-                        },
-                        modifier =
-                            Modifier
-                                .align(Alignment.CenterStart)
-                                .padding(start = 4.dp),
-                    ) {
-                        Icon(
-                            Icons.AutoMirrored.Filled.KeyboardArrowLeft,
-                            contentDescription = "Previous",
-                            modifier = Modifier.size(28.dp),
-                            tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
-                        )
+                // State to track arrow visibility
+                var showLeftArrow by remember { mutableStateOf(false) }
+                var showRightArrow by remember { mutableStateOf(false) }
+
+                // Auto-hide arrows after delay
+                LaunchedEffect(showLeftArrow) {
+                    if (showLeftArrow) {
+                        kotlinx.coroutines.delay(800)
+                        showLeftArrow = false
+                    }
+                }
+                LaunchedEffect(showRightArrow) {
+                    if (showRightArrow) {
+                        kotlinx.coroutines.delay(800)
+                        showRightArrow = false
                     }
                 }
 
-                // Next button
+                // Previous tap zone (left edge)
+                if (canGoBack) {
+                    Box(
+                        modifier =
+                            Modifier
+                                .align(Alignment.CenterStart)
+                                .fillMaxHeight(0.6f)
+                                .width(60.dp)
+                                .pointerInput(Unit) {
+                                    detectTapGestures(
+                                        onTap = {
+                                            showLeftArrow = true
+                                            coroutineScope.launch {
+                                                pagerState.animateScrollToPage(currentIndex - 1)
+                                            }
+                                        },
+                                    )
+                                },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        androidx.compose.animation.AnimatedVisibility(
+                            visible = showLeftArrow,
+                            enter = androidx.compose.animation.fadeIn(),
+                            exit = androidx.compose.animation.fadeOut(),
+                        ) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.KeyboardArrowLeft,
+                                contentDescription = "Previous",
+                                modifier = Modifier.size(36.dp),
+                                tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
+                            )
+                        }
+                    }
+                }
+
+                // Next tap zone (right edge)
                 if (canGoForward) {
-                    IconButton(
-                        onClick = {
-                            coroutineScope.launch {
-                                pagerState.animateScrollToPage(currentIndex + 1)
-                            }
-                        },
+                    Box(
                         modifier =
                             Modifier
                                 .align(Alignment.CenterEnd)
-                                .padding(end = 4.dp),
+                                .fillMaxHeight(0.6f)
+                                .width(60.dp)
+                                .pointerInput(Unit) {
+                                    detectTapGestures(
+                                        onTap = {
+                                            showRightArrow = true
+                                            coroutineScope.launch {
+                                                pagerState.animateScrollToPage(currentIndex + 1)
+                                            }
+                                        },
+                                    )
+                                },
+                        contentAlignment = Alignment.Center,
                     ) {
-                        Icon(
-                            Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                            contentDescription = "Next",
-                            modifier = Modifier.size(28.dp),
-                            tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
-                        )
+                        androidx.compose.animation.AnimatedVisibility(
+                            visible = showRightArrow,
+                            enter = androidx.compose.animation.fadeIn(),
+                            exit = androidx.compose.animation.fadeOut(),
+                        ) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                contentDescription = "Next",
+                                modifier = Modifier.size(36.dp),
+                                tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
+                            )
+                        }
                     }
                 }
             }
@@ -347,7 +402,7 @@ private fun PreviewContent(
                     }
 
                     FileType.PDF -> {
-                        PdfPreview(s3Object.fileName)
+                        PdfPreview(fileData, s3Object.fileName)
                     }
 
                     FileType.OTHER -> {
@@ -398,6 +453,14 @@ private fun ImagePreview(data: ByteArray) {
     var offsetX by remember { mutableFloatStateOf(0f) }
     var offsetY by remember { mutableFloatStateOf(0f) }
 
+    // Reset offset when returning to normal scale
+    LaunchedEffect(scale) {
+        if (scale <= 1f) {
+            offsetX = 0f
+            offsetY = 0f
+        }
+    }
+
     Box(
         modifier =
             Modifier
@@ -405,10 +468,27 @@ private fun ImagePreview(data: ByteArray) {
                 .background(Color.Black)
                 .pointerInput(Unit) {
                     detectTransformGestures { _, pan, zoom, _ ->
-                        scale = (scale * zoom).coerceIn(0.5f, 5f)
-                        offsetX += pan.x
-                        offsetY += pan.y
+                        val newScale = (scale * zoom).coerceIn(1f, 5f)
+                        scale = newScale
+                        // Only allow panning when zoomed in
+                        if (scale > 1f) {
+                            offsetX += pan.x
+                            offsetY += pan.y
+                        }
                     }
+                }.pointerInput(Unit) {
+                    detectTapGestures(
+                        onDoubleTap = {
+                            // Toggle between 1x and 2.5x zoom on double tap
+                            if (scale > 1f) {
+                                scale = 1f
+                                offsetX = 0f
+                                offsetY = 0f
+                            } else {
+                                scale = 2.5f
+                            }
+                        },
+                    )
                 },
         contentAlignment = Alignment.Center,
     ) {
@@ -447,6 +527,14 @@ private fun ImageStreamPreview(streamUrl: String) {
     var offsetX by remember { mutableFloatStateOf(0f) }
     var offsetY by remember { mutableFloatStateOf(0f) }
 
+    // Reset offset when returning to normal scale
+    LaunchedEffect(scale) {
+        if (scale <= 1f) {
+            offsetX = 0f
+            offsetY = 0f
+        }
+    }
+
     Box(
         modifier =
             Modifier
@@ -454,10 +542,27 @@ private fun ImageStreamPreview(streamUrl: String) {
                 .background(Color.Black)
                 .pointerInput(Unit) {
                     detectTransformGestures { _, pan, zoom, _ ->
-                        scale = (scale * zoom).coerceIn(0.5f, 5f)
-                        offsetX += pan.x
-                        offsetY += pan.y
+                        val newScale = (scale * zoom).coerceIn(1f, 5f)
+                        scale = newScale
+                        // Only allow panning when zoomed in
+                        if (scale > 1f) {
+                            offsetX += pan.x
+                            offsetY += pan.y
+                        }
                     }
+                }.pointerInput(Unit) {
+                    detectTapGestures(
+                        onDoubleTap = {
+                            // Toggle between 1x and 2.5x zoom on double tap
+                            if (scale > 1f) {
+                                scale = 1f
+                                offsetX = 0f
+                                offsetY = 0f
+                            } else {
+                                scale = 2.5f
+                            }
+                        },
+                    )
                 },
         contentAlignment = Alignment.Center,
     ) {
@@ -824,32 +929,245 @@ private fun TextPreview(data: ByteArray) {
 }
 
 @Composable
-private fun PdfPreview(fileName: String) {
-    Column(
+private fun PdfPreview(
+    fileData: ByteArray,
+    fileName: String,
+) {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+
+    // State for rendered PDF pages
+    var pdfPages by remember { mutableStateOf<List<Bitmap>>(emptyList()) }
+    var isLoading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var pageCount by remember { mutableIntStateOf(0) }
+
+    // Render PDF pages on composition
+    LaunchedEffect(fileData) {
+        isLoading = true
+        error = null
+
+        withContext(Dispatchers.IO) {
+            try {
+                // Write PDF data to temp file
+                val tempFile = File.createTempFile("pdf_preview", ".pdf", context.cacheDir)
+                tempFile.writeBytes(fileData)
+
+                // Open PDF with PdfRenderer
+                val parcelFileDescriptor =
+                    ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
+                val pdfRenderer = PdfRenderer(parcelFileDescriptor)
+
+                pageCount = pdfRenderer.pageCount
+                val renderedPages = mutableListOf<Bitmap>()
+
+                // Render each page (limit to first 50 pages for performance)
+                val maxPages = minOf(pdfRenderer.pageCount, 50)
+                for (i in 0 until maxPages) {
+                    val page = pdfRenderer.openPage(i)
+
+                    // Calculate bitmap size (2x for better quality on high-DPI screens)
+                    val scale = 2f
+                    val width = (page.width * scale).toInt()
+                    val height = (page.height * scale).toInt()
+
+                    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                    // Fill with white background
+                    bitmap.eraseColor(android.graphics.Color.WHITE)
+
+                    page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                    page.close()
+
+                    renderedPages.add(bitmap)
+                }
+
+                pdfRenderer.close()
+                parcelFileDescriptor.close()
+                tempFile.delete()
+
+                pdfPages = renderedPages
+                isLoading = false
+            } catch (e: Exception) {
+                android.util.Log.e("PdfPreview", "Failed to render PDF", e)
+                error = "Failed to render PDF: ${e.message}"
+                isLoading = false
+            }
+        }
+    }
+
+    // Clean up bitmaps when leaving composition
+    DisposableEffect(Unit) {
+        onDispose {
+            pdfPages.forEach { it.recycle() }
+        }
+    }
+
+    Box(
         modifier =
             Modifier
                 .fillMaxSize()
-                .padding(32.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
+                .background(MaterialTheme.colorScheme.surfaceVariant),
     ) {
-        Icon(
-            Icons.Default.PictureAsPdf,
-            contentDescription = null,
-            modifier = Modifier.size(96.dp),
-            tint = MaterialTheme.colorScheme.error,
-        )
-        Spacer(modifier = Modifier.height(16.dp))
-        Text(
-            fileName,
-            style = MaterialTheme.typography.titleMedium,
-        )
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(
-            "PDF preview not supported.\nDownload to view.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        when {
+            isLoading -> {
+                Column(
+                    modifier = Modifier.align(Alignment.Center),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    CircularProgressIndicator()
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text("Rendering PDF...")
+                }
+            }
+
+            error != null -> {
+                Column(
+                    modifier =
+                        Modifier
+                            .align(Alignment.Center)
+                            .padding(32.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Icon(
+                        Icons.Default.PictureAsPdf,
+                        contentDescription = null,
+                        modifier = Modifier.size(96.dp),
+                        tint = MaterialTheme.colorScheme.error,
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text(
+                        fileName,
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        error ?: "Unknown error",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+
+            pdfPages.isNotEmpty() -> {
+                val listState = rememberLazyListState()
+
+                Column(modifier = Modifier.fillMaxSize()) {
+                    // Page indicator
+                    val currentPage =
+                        remember(listState.firstVisibleItemIndex) {
+                            listState.firstVisibleItemIndex + 1
+                        }
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = MaterialTheme.colorScheme.surface,
+                        shadowElevation = 4.dp,
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = fileName,
+                                style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 1,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Text(
+                                text =
+                                    if (pageCount > pdfPages.size) {
+                                        "Page $currentPage of ${pdfPages.size} ($pageCount total)"
+                                    } else {
+                                        "Page $currentPage of $pageCount"
+                                    },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+
+                    // PDF pages
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(16.dp),
+                    ) {
+                        items(pdfPages.size) { index ->
+                            Card(
+                                modifier = Modifier.fillMaxWidth(),
+                                elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
+                            ) {
+                                Image(
+                                    bitmap = pdfPages[index].asImageBitmap(),
+                                    contentDescription = "Page ${index + 1}",
+                                    modifier = Modifier.fillMaxWidth(),
+                                    contentScale = ContentScale.FillWidth,
+                                )
+                            }
+                        }
+
+                        // Show indicator if there are more pages
+                        if (pageCount > pdfPages.size) {
+                            item {
+                                Card(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors =
+                                        CardDefaults.cardColors(
+                                            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                                        ),
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(24.dp),
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                    ) {
+                                        Text(
+                                            text = "${pageCount - pdfPages.size} more pages",
+                                            style = MaterialTheme.typography.titleMedium,
+                                        )
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            text = "Download the file to view all pages",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f),
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            else -> {
+                // Fallback - no pages rendered
+                Column(
+                    modifier =
+                        Modifier
+                            .align(Alignment.Center)
+                            .padding(32.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Icon(
+                        Icons.Default.PictureAsPdf,
+                        contentDescription = null,
+                        modifier = Modifier.size(96.dp),
+                        tint = MaterialTheme.colorScheme.error,
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text(
+                        fileName,
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        "No pages to display",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
     }
 }
 

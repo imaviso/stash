@@ -17,6 +17,7 @@ import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Date
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.hours
 
 class S3Service {
@@ -563,6 +564,78 @@ class S3Service {
                 url
             }.onFailure { e ->
                 Log.e(TAG, "Failed to generate presigned URL: ${e.message}", e)
+            }
+        }
+
+    /**
+     * Generate a presigned URL for sharing with configurable expiration.
+     * Wrapper around getPresignedUrl that accepts Duration directly.
+     */
+    suspend fun generateShareableUrl(
+        bucketName: String,
+        key: String,
+        expiresIn: Duration,
+    ): Result<String> = getPresignedUrl(bucketName, key, expiresIn)
+
+    /**
+     * List all objects recursively under a prefix (for folder operations).
+     * Returns flat list of all objects including nested ones.
+     */
+    suspend fun listObjectsRecursive(
+        bucketName: String,
+        prefix: String = "",
+    ): Result<List<S3Object>> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                Log.d(TAG, "Listing objects recursively in bucket: $bucketName, prefix: $prefix")
+
+                val allObjects = mutableListOf<S3Object>()
+                var continuationToken: String? = null
+                var pageCount = 0
+
+                do {
+                    pageCount++
+                    Log.d(TAG, "Fetching recursive page $pageCount, continuationToken: ${continuationToken?.take(20)}...")
+
+                    val response =
+                        requireClient().listObjectsV2(
+                            ListObjectsV2Request {
+                                bucket = bucketName
+                                this.prefix = prefix
+                                // No delimiter - get all nested objects
+                                this.continuationToken = continuationToken
+                                maxKeys = 1000
+                            },
+                        )
+
+                    // Add all objects (no folder filtering)
+                    response.contents?.forEach { obj ->
+                        val key = obj.key ?: ""
+                        if (key.isNotEmpty() && key != prefix) {
+                            allObjects.add(
+                                S3Object(
+                                    key = key,
+                                    size = obj.size ?: 0,
+                                    lastModified = obj.lastModified?.let { Date(it.epochSeconds * 1000) },
+                                    etag = obj.eTag,
+                                    storageClass = obj.storageClass?.value,
+                                ),
+                            )
+                        }
+                    }
+
+                    continuationToken =
+                        if (response.isTruncated == true) {
+                            response.nextContinuationToken
+                        } else {
+                            null
+                        }
+                } while (continuationToken != null)
+
+                Log.d(TAG, "Found ${allObjects.size} objects recursively across $pageCount page(s)")
+                allObjects.toList()
+            }.onFailure { e ->
+                Log.e(TAG, "Failed to list objects recursively: ${e.message}", e)
             }
         }
 
