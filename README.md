@@ -6,11 +6,15 @@ A simple Android app for browsing S3-compatible storage. Built with Jetpack Comp
 
 ## Features
 
-- **Multi-account support** - Add and switch between multiple S3 accounts
 - **File browser** - Navigate buckets and folders with list or grid view
-- **File operations** - Upload, download, rename, delete files
+- **File operations** - Upload, download, rename, delete files and folders
 - **Multi-select** - Copy, cut, paste, and bulk delete files
-- **File preview** - View images, play videos/audio with streaming support
+- **File preview** - View images, PDFs, play videos/audio with streaming support
+- **Share-to-upload** - Share files from any app directly to S3
+- **Presigned URL sharing** - Generate shareable links with configurable expiration
+- **Background transfers** - Uploads and downloads continue when app is backgrounded
+- **Storage stats** - View storage usage breakdown by file type
+- **Recursive folder operations** - Download or delete entire folders
 - **Search** - Find files within the current directory
 - **Sorting** - Sort by name, date, or size (ascending/descending)
 - **Breadcrumb navigation** - Quickly navigate folder hierarchy
@@ -68,7 +72,7 @@ Requires:
 ```
 app/src/main/java/com/imaviso/stash/
 ├── data/
-│   ├── model/          # Data classes (S3Account, S3Object, etc.)
+│   ├── model/          # Data classes (S3Object, S3Config, etc.)
 │   ├── remote/         # S3 service with AWS SDK
 │   └── repository/     # DataStore persistence
 ├── ui/
@@ -76,7 +80,10 @@ app/src/main/java/com/imaviso/stash/
 │   ├── screens/        # Compose screens
 │   ├── theme/          # Material 3 theming
 │   └── viewmodel/      # ViewModels
-└── MainActivity.kt
+├── worker/             # WorkManager for background transfers
+├── MainActivity.kt
+├── ShareReceiverActivity.kt  # Handles share intents
+└── StashApplication.kt
 ```
 
 ## Configuration
