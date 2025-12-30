@@ -4,13 +4,18 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -33,31 +38,104 @@ import coil.compose.AsyncImagePainter
 import coil.request.ImageRequest
 import com.imaviso.stash.data.model.FileType
 import com.imaviso.stash.data.model.S3Object
+import kotlinx.coroutines.launch
 import java.io.File
 
-@OptIn(ExperimentalMaterial3Api::class)
+/**
+ * Data class to hold preview state for a single file
+ */
+data class PreviewState(
+    val fileData: ByteArray? = null,
+    val streamUrl: String? = null,
+    val isLoading: Boolean = true,
+    val error: String? = null,
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+        other as PreviewState
+        if (fileData != null) {
+            if (other.fileData == null) return false
+            if (!fileData.contentEquals(other.fileData)) return false
+        } else if (other.fileData != null) {
+            return false
+        }
+        if (streamUrl != other.streamUrl) return false
+        if (isLoading != other.isLoading) return false
+        if (error != other.error) return false
+        return true
+    }
+
+    override fun hashCode(): Int {
+        var result = fileData?.contentHashCode() ?: 0
+        result = 31 * result + (streamUrl?.hashCode() ?: 0)
+        result = 31 * result + isLoading.hashCode()
+        result = 31 * result + (error?.hashCode() ?: 0)
+        return result
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun FilePreviewScreen(
-    s3Object: S3Object,
+    previewableObjects: List<S3Object>,
+    currentIndex: Int,
+    currentObject: S3Object,
     fileData: ByteArray?,
-    streamUrl: String?,  // For streaming video/audio
+    streamUrl: String?,
     isLoading: Boolean,
     error: String?,
     onNavigateBack: () -> Unit,
-    onDownload: () -> Unit,
-    onDelete: () -> Unit,
-    onOpenWith: ((File) -> Unit)? = null  // Callback when file is ready for external app
+    onPageChanged: (Int) -> Unit,
+    onDownload: (S3Object) -> Unit,
+    onDelete: (S3Object) -> Unit,
+    onOpenWith: ((S3Object, File) -> Unit)? = null,
 ) {
     val context = LocalContext.current
-    
+    val coroutineScope = rememberCoroutineScope()
+
+    // Navigation helpers
+    val canGoBack = currentIndex > 0
+    val canGoForward = currentIndex < previewableObjects.size - 1
+
+    // Pager state - start at the current index
+    val pagerState =
+        rememberPagerState(
+            initialPage = currentIndex,
+            pageCount = { previewableObjects.size },
+        )
+
+    // Track page changes and notify parent
+    LaunchedEffect(pagerState.settledPage) {
+        if (pagerState.settledPage != currentIndex) {
+            onPageChanged(pagerState.settledPage)
+        }
+    }
+
+    // Update pager when external index changes (e.g., via delete)
+    LaunchedEffect(currentIndex) {
+        if (pagerState.currentPage != currentIndex && currentIndex < previewableObjects.size) {
+            pagerState.scrollToPage(currentIndex)
+        }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { 
-                    Text(
-                        s3Object.fileName,
-                        maxLines = 1
-                    )
+                title = {
+                    Column {
+                        Text(
+                            currentObject.fileName,
+                            maxLines = 1,
+                        )
+                        if (previewableObjects.size > 1) {
+                            Text(
+                                "${currentIndex + 1} of ${previewableObjects.size}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
                 },
                 navigationIcon = {
                     IconButton(onClick = onNavigateBack) {
@@ -72,90 +150,101 @@ fun FilePreviewScreen(
                                 // Write to temp file and open
                                 try {
                                     val sharedDir = File(context.cacheDir, "shared").apply { mkdirs() }
-                                    val tempFile = File(sharedDir, s3Object.fileName)
+                                    val tempFile = File(sharedDir, currentObject.fileName)
                                     tempFile.writeBytes(fileData)
-                                    openWithExternalApp(context, tempFile, s3Object.mimeType)
+                                    openWithExternalApp(context, tempFile, currentObject.mimeType)
                                 } catch (e: Exception) {
                                     Toast.makeText(context, "Failed to open: ${e.message}", Toast.LENGTH_SHORT).show()
                                 }
-                            }
+                            },
                         ) {
                             Icon(Icons.Default.OpenInNew, contentDescription = "Open with")
                         }
                     }
-                    IconButton(onClick = onDownload) {
+                    IconButton(onClick = { onDownload(currentObject) }) {
                         Icon(Icons.Default.Download, contentDescription = "Download")
                     }
-                    IconButton(onClick = onDelete) {
+                    IconButton(onClick = { onDelete(currentObject) }) {
                         Icon(Icons.Default.Delete, contentDescription = "Delete")
                     }
-                }
+                },
             )
-        }
+        },
     ) { padding ->
         Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding),
-            contentAlignment = Alignment.Center
+            modifier =
+                Modifier
+                    .fillMaxSize()
+                    .padding(padding),
         ) {
-            when {
-                isLoading -> {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        CircularProgressIndicator()
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Text("Loading ${s3Object.fileName}...")
-                        Text(
-                            s3Object.formattedSize,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
+            HorizontalPager(
+                state = pagerState,
+                modifier = Modifier.fillMaxSize(),
+                key = { previewableObjects[it].key },
+            ) { page ->
+                val pageObject = previewableObjects[page]
+                val isCurrentPage = page == pagerState.settledPage
+
+                // Only show actual content for current page, neighbors show placeholder
+                if (isCurrentPage && pageObject.key == currentObject.key) {
+                    // Current page with loaded data
+                    PreviewContent(
+                        s3Object = currentObject,
+                        fileData = fileData,
+                        streamUrl = streamUrl,
+                        isLoading = isLoading,
+                        error = error,
+                    )
+                } else {
+                    // Placeholder for other pages (will load when swiped to)
+                    PreviewPlaceholder(s3Object = pageObject)
                 }
-                error != null -> {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier.padding(32.dp)
+            }
+
+            // Navigation buttons overlay (only show if more than one file)
+            if (previewableObjects.size > 1) {
+                // Previous button
+                if (canGoBack) {
+                    IconButton(
+                        onClick = {
+                            coroutineScope.launch {
+                                pagerState.animateScrollToPage(currentIndex - 1)
+                            }
+                        },
+                        modifier =
+                            Modifier
+                                .align(Alignment.CenterStart)
+                                .padding(start = 4.dp),
                     ) {
                         Icon(
-                            Icons.Default.Error,
-                            contentDescription = null,
-                            modifier = Modifier.size(64.dp),
-                            tint = MaterialTheme.colorScheme.error
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Text("Failed to load file")
-                        Text(
-                            error,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            Icons.AutoMirrored.Filled.KeyboardArrowLeft,
+                            contentDescription = "Previous",
+                            modifier = Modifier.size(28.dp),
+                            tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
                         )
                     }
                 }
-                fileData != null -> {
-                    when (s3Object.fileType) {
-                        FileType.IMAGE -> ImagePreview(fileData)
-                        FileType.VIDEO, FileType.AUDIO -> {
-                            // Should use streamUrl, but fallback to data if available
-                            Text("Use streaming URL for video/audio")
-                        }
-                        FileType.TEXT -> TextPreview(fileData)
-                        FileType.PDF -> PdfPreview(s3Object.fileName)
-                        FileType.OTHER -> UnsupportedPreview(s3Object)
+
+                // Next button
+                if (canGoForward) {
+                    IconButton(
+                        onClick = {
+                            coroutineScope.launch {
+                                pagerState.animateScrollToPage(currentIndex + 1)
+                            }
+                        },
+                        modifier =
+                            Modifier
+                                .align(Alignment.CenterEnd)
+                                .padding(end = 4.dp),
+                    ) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                            contentDescription = "Next",
+                            modifier = Modifier.size(28.dp),
+                            tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
+                        )
                     }
-                }
-                streamUrl != null -> {
-                    // Streaming video/audio from presigned URL
-                    when (s3Object.fileType) {
-                        FileType.VIDEO -> VideoStreamPreview(streamUrl)
-                        FileType.AUDIO -> AudioStreamPreview(streamUrl, s3Object.fileName)
-                        else -> UnsupportedPreview(s3Object)
-                    }
-                }
-                else -> {
-                    Text("No data available")
                 }
             }
         }
@@ -163,44 +252,189 @@ fun FilePreviewScreen(
 }
 
 @Composable
+private fun PreviewPlaceholder(s3Object: S3Object) {
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            CircularProgressIndicator()
+            Spacer(modifier = Modifier.height(16.dp))
+            Text("Loading ${s3Object.fileName}...")
+            Text(
+                s3Object.formattedSize,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun PreviewContent(
+    s3Object: S3Object,
+    fileData: ByteArray?,
+    streamUrl: String?,
+    isLoading: Boolean,
+    error: String?,
+) {
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center,
+    ) {
+        when {
+            isLoading -> {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    CircularProgressIndicator()
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text("Loading ${s3Object.fileName}...")
+                    Text(
+                        s3Object.formattedSize,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+
+            error != null -> {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(32.dp),
+                ) {
+                    Icon(
+                        Icons.Default.Error,
+                        contentDescription = null,
+                        modifier = Modifier.size(64.dp),
+                        tint = MaterialTheme.colorScheme.error,
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text("Failed to load file")
+                    Text(
+                        error,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+
+            streamUrl != null -> {
+                // Streaming from presigned URL
+                when (s3Object.fileType) {
+                    FileType.VIDEO -> VideoStreamPreview(streamUrl)
+                    FileType.AUDIO -> AudioStreamPreview(streamUrl, s3Object.fileName)
+                    FileType.IMAGE -> ImageStreamPreview(streamUrl)
+                    else -> UnsupportedPreview(s3Object)
+                }
+            }
+
+            fileData != null -> {
+                when (s3Object.fileType) {
+                    FileType.IMAGE -> {
+                        ImagePreview(fileData)
+                    }
+
+                    FileType.VIDEO, FileType.AUDIO -> {
+                        // Should use streamUrl, but fallback to data if available
+                        Text("Use streaming URL for video/audio")
+                    }
+
+                    FileType.TEXT -> {
+                        TextPreview(fileData)
+                    }
+
+                    FileType.PDF -> {
+                        PdfPreview(s3Object.fileName)
+                    }
+
+                    FileType.OTHER -> {
+                        UnsupportedPreview(s3Object)
+                    }
+                }
+            }
+
+            else -> {
+                Text("No data available")
+            }
+        }
+    }
+}
+
+// Legacy single-file preview for backward compatibility
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun FilePreviewScreen(
+    s3Object: S3Object,
+    fileData: ByteArray?,
+    streamUrl: String?, // For streaming video/audio
+    isLoading: Boolean,
+    error: String?,
+    onNavigateBack: () -> Unit,
+    onDownload: () -> Unit,
+    onDelete: () -> Unit,
+    onOpenWith: ((File) -> Unit)? = null, // Callback when file is ready for external app
+) {
+    FilePreviewScreen(
+        previewableObjects = listOf(s3Object),
+        currentIndex = 0,
+        currentObject = s3Object,
+        fileData = fileData,
+        streamUrl = streamUrl,
+        isLoading = isLoading,
+        error = error,
+        onNavigateBack = onNavigateBack,
+        onPageChanged = { },
+        onDownload = { onDownload() },
+        onDelete = { onDelete() },
+    )
+}
+
+@Composable
 private fun ImagePreview(data: ByteArray) {
     var scale by remember { mutableFloatStateOf(1f) }
     var offsetX by remember { mutableFloatStateOf(0f) }
     var offsetY by remember { mutableFloatStateOf(0f) }
-    
+
     Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.Black)
-            .pointerInput(Unit) {
-                detectTransformGestures { _, pan, zoom, _ ->
-                    scale = (scale * zoom).coerceIn(0.5f, 5f)
-                    offsetX += pan.x
-                    offsetY += pan.y
-                }
-            },
-        contentAlignment = Alignment.Center
+        modifier =
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black)
+                .pointerInput(Unit) {
+                    detectTransformGestures { _, pan, zoom, _ ->
+                        scale = (scale * zoom).coerceIn(0.5f, 5f)
+                        offsetX += pan.x
+                        offsetY += pan.y
+                    }
+                },
+        contentAlignment = Alignment.Center,
     ) {
         var imageState by remember { mutableStateOf<AsyncImagePainter.State?>(null) }
-        
+
         AsyncImage(
-            model = ImageRequest.Builder(LocalContext.current)
-                .data(data)
-                .crossfade(true)
-                .build(),
+            model =
+                ImageRequest
+                    .Builder(LocalContext.current)
+                    .data(data)
+                    .crossfade(true)
+                    .build(),
             contentDescription = "Image preview",
-            modifier = Modifier
-                .fillMaxSize()
-                .graphicsLayer(
-                    scaleX = scale,
-                    scaleY = scale,
-                    translationX = offsetX,
-                    translationY = offsetY
-                ),
+            modifier =
+                Modifier
+                    .fillMaxSize()
+                    .graphicsLayer(
+                        scaleX = scale,
+                        scaleY = scale,
+                        translationX = offsetX,
+                        translationY = offsetY,
+                    ),
             contentScale = ContentScale.Fit,
-            onState = { imageState = it }
+            onState = { imageState = it },
         )
-        
+
         if (imageState is AsyncImagePainter.State.Loading) {
             CircularProgressIndicator(color = Color.White)
         }
@@ -208,36 +442,113 @@ private fun ImagePreview(data: ByteArray) {
 }
 
 @Composable
-private fun VideoPreview(data: ByteArray, mimeType: String) {
+private fun ImageStreamPreview(streamUrl: String) {
+    var scale by remember { mutableFloatStateOf(1f) }
+    var offsetX by remember { mutableFloatStateOf(0f) }
+    var offsetY by remember { mutableFloatStateOf(0f) }
+
+    Box(
+        modifier =
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black)
+                .pointerInput(Unit) {
+                    detectTransformGestures { _, pan, zoom, _ ->
+                        scale = (scale * zoom).coerceIn(0.5f, 5f)
+                        offsetX += pan.x
+                        offsetY += pan.y
+                    }
+                },
+        contentAlignment = Alignment.Center,
+    ) {
+        var imageState by remember { mutableStateOf<AsyncImagePainter.State?>(null) }
+
+        AsyncImage(
+            model =
+                ImageRequest
+                    .Builder(LocalContext.current)
+                    .data(streamUrl)
+                    .crossfade(true)
+                    .build(),
+            contentDescription = "Image preview",
+            modifier =
+                Modifier
+                    .fillMaxSize()
+                    .graphicsLayer(
+                        scaleX = scale,
+                        scaleY = scale,
+                        translationX = offsetX,
+                        translationY = offsetY,
+                    ),
+            contentScale = ContentScale.Fit,
+            onState = { imageState = it },
+        )
+
+        when (imageState) {
+            is AsyncImagePainter.State.Loading -> {
+                CircularProgressIndicator(color = Color.White)
+            }
+
+            is AsyncImagePainter.State.Error -> {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Icon(
+                        Icons.Default.BrokenImage,
+                        contentDescription = null,
+                        modifier = Modifier.size(64.dp),
+                        tint = Color.White.copy(alpha = 0.7f),
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        "Failed to load image",
+                        color = Color.White.copy(alpha = 0.7f),
+                    )
+                }
+            }
+
+            else -> { }
+        }
+    }
+}
+
+@Composable
+private fun VideoPreview(
+    data: ByteArray,
+    mimeType: String,
+) {
     val context = LocalContext.current
-    
+
     // Write to temp file for ExoPlayer
-    val tempFile = remember(data) {
-        File.createTempFile("video_preview", ".tmp", context.cacheDir).apply {
-            writeBytes(data)
-            deleteOnExit()
+    val tempFile =
+        remember(data) {
+            File.createTempFile("video_preview", ".tmp", context.cacheDir).apply {
+                writeBytes(data)
+                deleteOnExit()
+            }
         }
-    }
-    
-    val exoPlayer = remember {
-        ExoPlayer.Builder(context).build().apply {
-            val mediaItem = MediaItem.fromUri(Uri.fromFile(tempFile))
-            setMediaItem(mediaItem)
-            prepare()
+
+    val exoPlayer =
+        remember {
+            ExoPlayer.Builder(context).build().apply {
+                val mediaItem = MediaItem.fromUri(Uri.fromFile(tempFile))
+                setMediaItem(mediaItem)
+                prepare()
+            }
         }
-    }
-    
+
     DisposableEffect(Unit) {
         onDispose {
             exoPlayer.release()
             tempFile.delete()
         }
     }
-    
+
     Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.Black)
+        modifier =
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black),
     ) {
         AndroidView(
             factory = { ctx ->
@@ -246,61 +557,68 @@ private fun VideoPreview(data: ByteArray, mimeType: String) {
                     useController = true
                 }
             },
-            modifier = Modifier.fillMaxSize()
+            modifier = Modifier.fillMaxSize(),
         )
     }
 }
 
 @Composable
-private fun AudioPreview(data: ByteArray, mimeType: String, fileName: String) {
+private fun AudioPreview(
+    data: ByteArray,
+    mimeType: String,
+    fileName: String,
+) {
     val context = LocalContext.current
-    
+
     // Write to temp file for ExoPlayer
-    val tempFile = remember(data) {
-        File.createTempFile("audio_preview", ".tmp", context.cacheDir).apply {
-            writeBytes(data)
-            deleteOnExit()
+    val tempFile =
+        remember(data) {
+            File.createTempFile("audio_preview", ".tmp", context.cacheDir).apply {
+                writeBytes(data)
+                deleteOnExit()
+            }
         }
-    }
-    
-    val exoPlayer = remember {
-        ExoPlayer.Builder(context).build().apply {
-            val mediaItem = MediaItem.fromUri(Uri.fromFile(tempFile))
-            setMediaItem(mediaItem)
-            prepare()
+
+    val exoPlayer =
+        remember {
+            ExoPlayer.Builder(context).build().apply {
+                val mediaItem = MediaItem.fromUri(Uri.fromFile(tempFile))
+                setMediaItem(mediaItem)
+                prepare()
+            }
         }
-    }
-    
+
     DisposableEffect(Unit) {
         onDispose {
             exoPlayer.release()
             tempFile.delete()
         }
     }
-    
+
     Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp),
+        modifier =
+            Modifier
+                .fillMaxSize()
+                .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+        verticalArrangement = Arrangement.Center,
     ) {
         Icon(
             Icons.Default.MusicNote,
             contentDescription = null,
             modifier = Modifier.size(128.dp),
-            tint = MaterialTheme.colorScheme.primary
+            tint = MaterialTheme.colorScheme.primary,
         )
-        
+
         Spacer(modifier = Modifier.height(24.dp))
-        
+
         Text(
             fileName,
-            style = MaterialTheme.typography.titleLarge
+            style = MaterialTheme.typography.titleLarge,
         )
-        
+
         Spacer(modifier = Modifier.height(32.dp))
-        
+
         AndroidView(
             factory = { ctx ->
                 PlayerView(ctx).apply {
@@ -308,9 +626,10 @@ private fun AudioPreview(data: ByteArray, mimeType: String, fileName: String) {
                     useController = true
                 }
             },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(80.dp)
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .height(80.dp),
         )
     }
 }
@@ -320,33 +639,37 @@ private fun AudioPreview(data: ByteArray, mimeType: String, fileName: String) {
 private fun VideoStreamPreview(streamUrl: String) {
     val context = LocalContext.current
     var errorMessage by remember { mutableStateOf<String?>(null) }
-    
-    val exoPlayer = remember(streamUrl) {
-        ExoPlayer.Builder(context).build().apply {
-            val mediaItem = MediaItem.fromUri(streamUrl)
-            setMediaItem(mediaItem)
-            addListener(object : androidx.media3.common.Player.Listener {
-                override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                    android.util.Log.e("VideoPreview", "ExoPlayer error: ${error.message}", error)
-                    errorMessage = "Playback error: ${error.message}"
-                }
-            })
-            prepare()
-            playWhenReady = true
+
+    val exoPlayer =
+        remember(streamUrl) {
+            ExoPlayer.Builder(context).build().apply {
+                val mediaItem = MediaItem.fromUri(streamUrl)
+                setMediaItem(mediaItem)
+                addListener(
+                    object : androidx.media3.common.Player.Listener {
+                        override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                            android.util.Log.e("VideoPreview", "ExoPlayer error: ${error.message}", error)
+                            errorMessage = "Playback error: ${error.message}"
+                        }
+                    },
+                )
+                prepare()
+                playWhenReady = true
+            }
         }
-    }
-    
+
     DisposableEffect(streamUrl) {
         onDispose {
             exoPlayer.release()
         }
     }
-    
+
     Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.Black),
-        contentAlignment = Alignment.Center
+        modifier =
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black),
+        contentAlignment = Alignment.Center,
     ) {
         AndroidView(
             factory = { ctx ->
@@ -355,21 +678,22 @@ private fun VideoStreamPreview(streamUrl: String) {
                     useController = true
                 }
             },
-            modifier = Modifier.fillMaxSize()
+            modifier = Modifier.fillMaxSize(),
         )
-        
+
         // Show error if playback fails
         errorMessage?.let { error ->
             Card(
                 modifier = Modifier.padding(16.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.errorContainer
-                )
+                colors =
+                    CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer,
+                    ),
             ) {
                 Text(
                     text = error,
                     modifier = Modifier.padding(16.dp),
-                    color = MaterialTheme.colorScheme.onErrorContainer
+                    color = MaterialTheme.colorScheme.onErrorContainer,
                 )
             }
         }
@@ -378,70 +702,78 @@ private fun VideoStreamPreview(streamUrl: String) {
 
 // Streaming audio preview from presigned URL
 @Composable
-private fun AudioStreamPreview(streamUrl: String, fileName: String) {
+private fun AudioStreamPreview(
+    streamUrl: String,
+    fileName: String,
+) {
     val context = LocalContext.current
     var errorMessage by remember { mutableStateOf<String?>(null) }
-    
-    val exoPlayer = remember(streamUrl) {
-        ExoPlayer.Builder(context).build().apply {
-            val mediaItem = MediaItem.fromUri(streamUrl)
-            setMediaItem(mediaItem)
-            addListener(object : androidx.media3.common.Player.Listener {
-                override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                    android.util.Log.e("AudioPreview", "ExoPlayer error: ${error.message}", error)
-                    errorMessage = "Playback error: ${error.message}"
-                }
-            })
-            prepare()
+
+    val exoPlayer =
+        remember(streamUrl) {
+            ExoPlayer.Builder(context).build().apply {
+                val mediaItem = MediaItem.fromUri(streamUrl)
+                setMediaItem(mediaItem)
+                addListener(
+                    object : androidx.media3.common.Player.Listener {
+                        override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                            android.util.Log.e("AudioPreview", "ExoPlayer error: ${error.message}", error)
+                            errorMessage = "Playback error: ${error.message}"
+                        }
+                    },
+                )
+                prepare()
+            }
         }
-    }
-    
+
     DisposableEffect(streamUrl) {
         onDispose {
             exoPlayer.release()
         }
     }
-    
+
     Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp),
+        modifier =
+            Modifier
+                .fillMaxSize()
+                .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+        verticalArrangement = Arrangement.Center,
     ) {
         // Show error if playback fails
         errorMessage?.let { error ->
             Card(
                 modifier = Modifier.padding(16.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.errorContainer
-                )
+                colors =
+                    CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer,
+                    ),
             ) {
                 Text(
                     text = error,
                     modifier = Modifier.padding(16.dp),
-                    color = MaterialTheme.colorScheme.onErrorContainer
+                    color = MaterialTheme.colorScheme.onErrorContainer,
                 )
             }
             Spacer(modifier = Modifier.height(16.dp))
         }
-        
+
         Icon(
             Icons.Default.MusicNote,
             contentDescription = null,
             modifier = Modifier.size(128.dp),
-            tint = MaterialTheme.colorScheme.primary
+            tint = MaterialTheme.colorScheme.primary,
         )
-        
+
         Spacer(modifier = Modifier.height(24.dp))
-        
+
         Text(
             fileName,
-            style = MaterialTheme.typography.titleLarge
+            style = MaterialTheme.typography.titleLarge,
         )
-        
+
         Spacer(modifier = Modifier.height(32.dp))
-        
+
         AndroidView(
             factory = { ctx ->
                 PlayerView(ctx).apply {
@@ -449,39 +781,43 @@ private fun AudioStreamPreview(streamUrl: String, fileName: String) {
                     useController = true
                 }
             },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(80.dp)
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .height(80.dp),
         )
     }
 }
 
 @Composable
 private fun TextPreview(data: ByteArray) {
-    val text = remember(data) {
-        try {
-            String(data, Charsets.UTF_8)
-        } catch (e: Exception) {
-            "Unable to decode text content"
+    val text =
+        remember(data) {
+            try {
+                String(data, Charsets.UTF_8)
+            } catch (e: Exception) {
+                "Unable to decode text content"
+            }
         }
-    }
-    
+
     Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp)
+        modifier =
+            Modifier
+                .fillMaxSize()
+                .padding(16.dp),
     ) {
         Card(
-            modifier = Modifier.fillMaxSize()
+            modifier = Modifier.fillMaxSize(),
         ) {
             Text(
                 text = text,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(16.dp)
-                    .verticalScroll(rememberScrollState()),
+                modifier =
+                    Modifier
+                        .fillMaxSize()
+                        .padding(16.dp)
+                        .verticalScroll(rememberScrollState()),
                 fontFamily = FontFamily.Monospace,
-                style = MaterialTheme.typography.bodySmall
+                style = MaterialTheme.typography.bodySmall,
             )
         }
     }
@@ -490,28 +826,29 @@ private fun TextPreview(data: ByteArray) {
 @Composable
 private fun PdfPreview(fileName: String) {
     Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(32.dp),
+        modifier =
+            Modifier
+                .fillMaxSize()
+                .padding(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+        verticalArrangement = Arrangement.Center,
     ) {
         Icon(
             Icons.Default.PictureAsPdf,
             contentDescription = null,
             modifier = Modifier.size(96.dp),
-            tint = MaterialTheme.colorScheme.error
+            tint = MaterialTheme.colorScheme.error,
         )
         Spacer(modifier = Modifier.height(16.dp))
         Text(
             fileName,
-            style = MaterialTheme.typography.titleMedium
+            style = MaterialTheme.typography.titleMedium,
         )
         Spacer(modifier = Modifier.height(8.dp))
         Text(
             "PDF preview not supported.\nDownload to view.",
             style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
@@ -519,55 +856,63 @@ private fun PdfPreview(fileName: String) {
 @Composable
 private fun UnsupportedPreview(s3Object: S3Object) {
     Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(32.dp),
+        modifier =
+            Modifier
+                .fillMaxSize()
+                .padding(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+        verticalArrangement = Arrangement.Center,
     ) {
         Icon(
             Icons.Default.InsertDriveFile,
             contentDescription = null,
             modifier = Modifier.size(96.dp),
-            tint = MaterialTheme.colorScheme.onSurfaceVariant
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(modifier = Modifier.height(16.dp))
         Text(
             s3Object.fileName,
-            style = MaterialTheme.typography.titleMedium
+            style = MaterialTheme.typography.titleMedium,
         )
         Spacer(modifier = Modifier.height(8.dp))
         Text(
             "Preview not available for this file type.",
             style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(modifier = Modifier.height(8.dp))
         Text(
             s3Object.formattedSize,
             style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
 
-private fun openWithExternalApp(context: Context, file: File, mimeType: String) {
+private fun openWithExternalApp(
+    context: Context,
+    file: File,
+    mimeType: String,
+) {
     try {
-        val uri = FileProvider.getUriForFile(
-            context,
-            "${context.packageName}.fileprovider",
-            file
-        )
-        
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, mimeType)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        
-        val chooser = Intent.createChooser(intent, "Open with").apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
+        val uri =
+            FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                file,
+            )
+
+        val intent =
+            Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, mimeType)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+
+        val chooser =
+            Intent.createChooser(intent, "Open with").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
         context.startActivity(chooser)
     } catch (e: Exception) {
         Toast.makeText(context, "Failed to open: ${e.message}", Toast.LENGTH_SHORT).show()

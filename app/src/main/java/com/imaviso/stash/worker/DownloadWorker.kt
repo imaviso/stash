@@ -49,6 +49,7 @@ class DownloadWorker(
         const val KEY_FILE_NAME = "file_name"
         const val KEY_FILE_SIZE = "file_size"
         const val KEY_MIME_TYPE = "mime_type"
+        const val KEY_TRANSFER_ID = "transfer_id"
 
         // Output/Progress data keys
         const val KEY_PROGRESS = "progress"
@@ -70,6 +71,10 @@ class DownloadWorker(
             fileName: String,
             fileSize: Long,
             mimeType: String,
+            transferId: String =
+                java.util.UUID
+                    .randomUUID()
+                    .toString(),
         ): Data =
             workDataOf(
                 KEY_BUCKET_NAME to bucketName,
@@ -77,6 +82,7 @@ class DownloadWorker(
                 KEY_FILE_NAME to fileName,
                 KEY_FILE_SIZE to fileSize,
                 KEY_MIME_TYPE to mimeType,
+                KEY_TRANSFER_ID to transferId,
             )
     }
 
@@ -96,8 +102,12 @@ class DownloadWorker(
             val fileName = inputData.getString(KEY_FILE_NAME) ?: objectKey.substringAfterLast('/')
             val fileSize = inputData.getLong(KEY_FILE_SIZE, 0L)
             val mimeType = inputData.getString(KEY_MIME_TYPE) ?: "application/octet-stream"
+            val transferId =
+                inputData.getString(KEY_TRANSFER_ID) ?: java.util.UUID
+                    .randomUUID()
+                    .toString()
 
-            Log.d(TAG, "Starting download: $fileName from $bucketName/$objectKey")
+            Log.d(TAG, "Starting download: $fileName from $bucketName/$objectKey (transferId: $transferId)")
 
             try {
                 // Get S3 config
@@ -109,7 +119,7 @@ class DownloadWorker(
                 }
 
                 // Set as foreground with notification
-                setForeground(createForegroundInfo(fileName, 0))
+                setForeground(createForegroundInfo(fileName, 0, transferId))
 
                 setProgress(
                     workDataOf(
@@ -155,7 +165,7 @@ class DownloadWorker(
                         KEY_TOTAL_BYTES to fileSize,
                     ),
                 )
-                setForeground(createForegroundInfo(fileName, 5))
+                setForeground(createForegroundInfo(fileName, 5, transferId))
 
                 // Download to temp file first
                 val tempFile = File.createTempFile("download_", ".tmp", applicationContext.cacheDir)
@@ -198,7 +208,7 @@ class DownloadWorker(
                                         KEY_TOTAL_BYTES to totalBytes,
                                     ),
                                 )
-                                setForeground(createForegroundInfo(fileName, progress))
+                                setForeground(createForegroundInfo(fileName, progress, transferId))
                             }
                         }
                     }
@@ -215,7 +225,7 @@ class DownloadWorker(
                 Log.d(TAG, "Saved to Downloads: $outputPath")
 
                 // Show completion notification
-                notificationManager.showDownloadComplete(fileName, true)
+                notificationManager.showDownloadComplete(fileName, true, transferId)
 
                 Result.success(
                     workDataOf(
@@ -228,7 +238,7 @@ class DownloadWorker(
                 )
             } catch (e: Exception) {
                 Log.e(TAG, "Download failed: ${e.message}", e)
-                notificationManager.showDownloadComplete(fileName, false)
+                notificationManager.showDownloadComplete(fileName, false, transferId)
                 Result.failure(
                     workDataOf(
                         KEY_STATUS to STATUS_FAILED,
@@ -279,6 +289,7 @@ class DownloadWorker(
     private fun createForegroundInfo(
         fileName: String,
         progress: Int,
+        transferId: String,
     ): ForegroundInfo {
         val notification =
             notificationManager
@@ -288,15 +299,17 @@ class DownloadWorker(
                     isIndeterminate = progress == 0,
                 ).build()
 
+        val notificationId = TransferNotificationManager.getNotificationId(transferId, false)
+
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             ForegroundInfo(
-                TransferNotificationManager.DOWNLOAD_NOTIFICATION_ID,
+                notificationId,
                 notification,
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
             )
         } else {
             ForegroundInfo(
-                TransferNotificationManager.DOWNLOAD_NOTIFICATION_ID,
+                notificationId,
                 notification,
             )
         }

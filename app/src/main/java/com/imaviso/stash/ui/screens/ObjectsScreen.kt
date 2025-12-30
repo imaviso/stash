@@ -61,6 +61,7 @@ import com.imaviso.stash.data.model.S3Object
 import com.imaviso.stash.ui.viewmodel.ClipboardAction
 import com.imaviso.stash.ui.viewmodel.ObjectsViewModel
 import com.imaviso.stash.ui.viewmodel.SortOption
+import com.imaviso.stash.ui.viewmodel.TransferType
 import com.imaviso.stash.ui.viewmodel.ViewMode
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.collectLatest
@@ -82,6 +83,10 @@ fun ObjectsScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     val keyboardController = LocalSoftwareKeyboardController.current
     val searchFocusRequester = remember { FocusRequester() }
+
+    // Transfers sheet state
+    var showTransfersSheet by remember { mutableStateOf(false) }
+    val transfersSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
     // Scroll state for list and grid views
     val listState =
@@ -190,24 +195,27 @@ fun ObjectsScreen(
         }
 
         FilePreviewScreen(
-            s3Object = uiState.previewObject!!,
+            previewableObjects = uiState.previewableObjects,
+            currentIndex = uiState.previewIndex,
+            currentObject = uiState.previewObject!!,
             fileData = uiState.previewData,
             streamUrl = uiState.previewStreamUrl,
             isLoading = uiState.isPreviewLoading,
             error = uiState.previewError,
             onNavigateBack = { viewModel.closePreview() },
-            onDownload = {
+            onPageChanged = { newIndex -> viewModel.navigateToPreviewIndex(newIndex) },
+            onDownload = { obj ->
                 // For streaming media or large files, use background download
-                if (uiState.previewStreamUrl != null || uiState.previewObject!!.size > 5 * 1024 * 1024) {
-                    viewModel.downloadFileInBackground(uiState.previewObject!!)
+                if (uiState.previewStreamUrl != null || obj.size > 5 * 1024 * 1024) {
+                    viewModel.downloadFileInBackground(obj)
                 } else {
                     uiState.previewData?.let { data ->
-                        saveFile(context, uiState.previewObject!!.fileName, data)
+                        saveFile(context, obj.fileName, data)
                     }
                 }
             },
-            onDelete = {
-                viewModel.showDeleteDialog(uiState.previewObject!!)
+            onDelete = { obj ->
+                viewModel.showDeleteDialog(obj)
                 viewModel.closePreview()
             },
         )
@@ -331,6 +339,20 @@ fun ObjectsScreen(
                         }
                     },
                     actions = {
+                        // Transfers indicator (only show when there are active transfers)
+                        if (uiState.activeTransfers.isNotEmpty()) {
+                            BadgedBox(
+                                badge = {
+                                    Badge {
+                                        Text(uiState.activeTransfers.size.toString())
+                                    }
+                                },
+                            ) {
+                                IconButton(onClick = { showTransfersSheet = true }) {
+                                    Icon(Icons.Default.SyncAlt, contentDescription = "Transfers")
+                                }
+                            }
+                        }
                         // Search
                         IconButton(onClick = { viewModel.toggleSearch() }) {
                             Icon(Icons.Default.Search, contentDescription = "Search")
@@ -692,6 +714,20 @@ fun ObjectsScreen(
             onDismiss = { viewModel.hideRenameDialog() },
             isRenaming = uiState.isRenaming,
         )
+    }
+
+    // Transfers Bottom Sheet
+    if (showTransfersSheet) {
+        ModalBottomSheet(
+            onDismissRequest = { showTransfersSheet = false },
+            sheetState = transfersSheetState,
+        ) {
+            TransfersSheetContent(
+                activeTransfers = uiState.activeTransfers,
+                onCancelTransfer = { transferId -> viewModel.cancelTransfer(transferId) },
+                onCancelAll = { viewModel.cancelBackgroundTransfers() },
+            )
+        }
     }
 }
 
@@ -1630,3 +1666,207 @@ private fun openFileWithExternalApp(
         Toast.makeText(context, "Failed to open file: ${e.message}", Toast.LENGTH_SHORT).show()
     }
 }
+
+@Composable
+private fun TransfersSheetContent(
+    activeTransfers: List<com.imaviso.stash.ui.viewmodel.TransferInfo>,
+    onCancelTransfer: (String) -> Unit,
+    onCancelAll: () -> Unit,
+) {
+    Column(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .padding(bottom = 32.dp),
+    ) {
+        // Header
+        Row(
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "Transfers (${activeTransfers.size})",
+                style = MaterialTheme.typography.titleLarge,
+            )
+            if (activeTransfers.isNotEmpty()) {
+                TextButton(onClick = onCancelAll) {
+                    Text("Cancel All")
+                }
+            }
+        }
+
+        HorizontalDivider()
+
+        if (activeTransfers.isEmpty()) {
+            // Empty state
+            Column(
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(32.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Icon(
+                    Icons.Default.CloudDone,
+                    contentDescription = null,
+                    modifier = Modifier.size(48.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    "No Active Transfers",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth(),
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                items(activeTransfers, key = { it.id }) { transfer ->
+                    TransferItemCard(
+                        transfer = transfer,
+                        onCancel = { onCancelTransfer(transfer.id) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TransferItemCard(
+    transfer: com.imaviso.stash.ui.viewmodel.TransferInfo,
+    onCancel: () -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Icon(
+                        imageVector =
+                            if (transfer.type == TransferType.UPLOAD) {
+                                Icons.Default.Upload
+                            } else {
+                                Icons.Default.Download
+                            },
+                        contentDescription = null,
+                        tint =
+                            if (transfer.error != null) {
+                                MaterialTheme.colorScheme.error
+                            } else {
+                                MaterialTheme.colorScheme.primary
+                            },
+                        modifier = Modifier.size(24.dp),
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = transfer.fileName,
+                            style = MaterialTheme.typography.titleSmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            text = transfer.status,
+                            style = MaterialTheme.typography.bodySmall,
+                            color =
+                                if (transfer.error != null) {
+                                    MaterialTheme.colorScheme.error
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                        )
+                    }
+                }
+
+                // Cancel button
+                if (transfer.error == null) {
+                    IconButton(
+                        onClick = onCancel,
+                        modifier = Modifier.size(32.dp),
+                    ) {
+                        Icon(
+                            Icons.Default.Close,
+                            contentDescription = "Cancel",
+                            modifier = Modifier.size(18.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+
+            // Progress bar
+            if (transfer.error == null) {
+                Spacer(modifier = Modifier.height(8.dp))
+                LinearProgressIndicator(
+                    progress = { transfer.progress / 100f },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+
+                // Size info
+                if (transfer.totalBytes > 0) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(
+                            text = formatTransferBytes(transfer.bytesTransferred),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            text = "${transfer.progress}%",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            text = formatTransferBytes(transfer.totalBytes),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+
+            // Error message
+            transfer.error?.let { error ->
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = error,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        }
+    }
+}
+
+private fun formatTransferBytes(bytes: Long): String =
+    when {
+        bytes < 1024 -> "$bytes B"
+        bytes < 1024 * 1024 -> "%.1f KB".format(bytes / 1024f)
+        bytes < 1024 * 1024 * 1024 -> "%.1f MB".format(bytes / (1024f * 1024f))
+        else -> "%.1f GB".format(bytes / (1024f * 1024f * 1024f))
+    }

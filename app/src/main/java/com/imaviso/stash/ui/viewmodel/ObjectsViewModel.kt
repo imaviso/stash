@@ -51,6 +51,25 @@ enum class ViewMode {
     GRID,
 }
 
+/**
+ * Represents a file transfer (upload or download) in progress
+ */
+enum class TransferType {
+    UPLOAD,
+    DOWNLOAD,
+}
+
+data class TransferInfo(
+    val id: String,
+    val fileName: String,
+    val type: TransferType,
+    val progress: Int = 0,
+    val bytesTransferred: Long = 0,
+    val totalBytes: Long = 0,
+    val status: String = "",
+    val error: String? = null,
+)
+
 data class ObjectsUiState(
     val bucketName: String = "",
     val currentPrefix: String = "",
@@ -62,6 +81,9 @@ data class ObjectsUiState(
     val selectedObject: S3Object? = null,
     val isDeleting: Boolean = false,
     val showUploadDialog: Boolean = false,
+    // Multiple concurrent transfers
+    val activeTransfers: List<TransferInfo> = emptyList(),
+    // Legacy single-file progress (for non-background transfers)
     val isUploading: Boolean = false,
     val uploadProgress: String = "",
     val uploadProgressPercent: Float = 0f,
@@ -81,6 +103,8 @@ data class ObjectsUiState(
     val previewStreamUrl: String? = null, // For streaming video/audio
     val isPreviewLoading: Boolean = false,
     val previewError: String? = null,
+    val previewableObjects: List<S3Object> = emptyList(), // List of files (non-folders) for swiping
+    val previewIndex: Int = 0, // Current index in previewableObjects
     // Clipboard for copy/move
     val clipboard: ClipboardData? = null,
     val isPasting: Boolean = false,
@@ -468,6 +492,10 @@ class ObjectsViewModel(
     fun openPreview(obj: S3Object) {
         if (obj.isFolder) return
 
+        // Build list of previewable files (non-folders) and find current index
+        val previewableFiles = sortObjects(_uiState.value.objects).filter { !it.isFolder }
+        val index = previewableFiles.indexOfFirst { it.key == obj.key }.coerceAtLeast(0)
+
         _uiState.value =
             _uiState.value.copy(
                 previewObject = obj,
@@ -475,13 +503,40 @@ class ObjectsViewModel(
                 previewStreamUrl = null,
                 isPreviewLoading = true,
                 previewError = null,
+                previewableObjects = previewableFiles,
+                previewIndex = index,
             )
 
+        loadPreviewData(obj)
+    }
+
+    /**
+     * Navigate to a specific index in the preview list (used by pager)
+     */
+    fun navigateToPreviewIndex(index: Int) {
+        val previewableFiles = _uiState.value.previewableObjects
+        if (index < 0 || index >= previewableFiles.size) return
+
+        val obj = previewableFiles[index]
+        _uiState.value =
+            _uiState.value.copy(
+                previewObject = obj,
+                previewData = null,
+                previewStreamUrl = null,
+                isPreviewLoading = true,
+                previewError = null,
+                previewIndex = index,
+            )
+
+        loadPreviewData(obj)
+    }
+
+    private fun loadPreviewData(obj: S3Object) {
         viewModelScope.launch {
-            // For video/audio, use presigned URL for streaming instead of downloading
+            // For video/audio/images, use presigned URL for streaming instead of downloading
             // This prevents OutOfMemoryError for large media files
             when (obj.fileType) {
-                FileType.VIDEO, FileType.AUDIO -> {
+                FileType.VIDEO, FileType.AUDIO, FileType.IMAGE -> {
                     s3Service
                         .getPresignedUrl(_uiState.value.bucketName, obj.key)
                         .onSuccess { url ->
@@ -500,7 +555,7 @@ class ObjectsViewModel(
                 }
 
                 else -> {
-                    // For other file types (images, text), download the bytes
+                    // For other file types (text, PDF, etc.), download the bytes
                     // Limit download size to prevent OOM (10 MB max for in-memory)
                     if (obj.size > 10 * 1024 * 1024) {
                         _uiState.value =
@@ -539,6 +594,8 @@ class ObjectsViewModel(
                 previewStreamUrl = null,
                 isPreviewLoading = false,
                 previewError = null,
+                previewableObjects = emptyList(),
+                previewIndex = 0,
             )
     }
 
@@ -775,6 +832,28 @@ class ObjectsViewModel(
     private val workManager = WorkManager.getInstance(application)
 
     /**
+     * Helper to add or update a transfer in the active transfers list
+     */
+    private fun updateTransfer(transfer: TransferInfo) {
+        val currentTransfers = _uiState.value.activeTransfers.toMutableList()
+        val existingIndex = currentTransfers.indexOfFirst { it.id == transfer.id }
+        if (existingIndex >= 0) {
+            currentTransfers[existingIndex] = transfer
+        } else {
+            currentTransfers.add(transfer)
+        }
+        _uiState.value = _uiState.value.copy(activeTransfers = currentTransfers)
+    }
+
+    /**
+     * Helper to remove a transfer from the active transfers list
+     */
+    private fun removeTransfer(transferId: String) {
+        val currentTransfers = _uiState.value.activeTransfers.filter { it.id != transferId }
+        _uiState.value = _uiState.value.copy(activeTransfers = currentTransfers)
+    }
+
+    /**
      * Upload a file in the background using WorkManager.
      * The upload will continue even if the app is backgrounded.
      */
@@ -784,6 +863,10 @@ class ObjectsViewModel(
         contentType: String,
     ) {
         val objectKey = _uiState.value.currentPrefix + fileName
+        val transferId =
+            java.util.UUID
+                .randomUUID()
+                .toString()
 
         val inputData =
             UploadWorker.createInputData(
@@ -792,18 +875,29 @@ class ObjectsViewModel(
                 fileUri = uri.toString(),
                 contentType = contentType,
                 fileName = fileName,
+                transferId = transferId,
             )
 
         val uploadRequest =
             OneTimeWorkRequestBuilder<UploadWorker>()
                 .setInputData(inputData)
                 .addTag("upload")
-                .addTag("upload_${objectKey.hashCode()}")
+                .addTag("transfer_$transferId")
                 .build()
 
+        // Add to active transfers immediately
+        updateTransfer(
+            TransferInfo(
+                id = transferId,
+                fileName = fileName,
+                type = TransferType.UPLOAD,
+                status = "Preparing...",
+            ),
+        )
+
         workManager.enqueueUniqueWork(
-            "upload_${objectKey.hashCode()}",
-            ExistingWorkPolicy.REPLACE,
+            "upload_$transferId",
+            ExistingWorkPolicy.KEEP,
             uploadRequest,
         )
 
@@ -814,48 +908,53 @@ class ObjectsViewModel(
                     WorkInfo.State.RUNNING -> {
                         val progress = workInfo.progress.getInt(UploadWorker.KEY_PROGRESS, 0)
                         val status = workInfo.progress.getString(UploadWorker.KEY_STATUS) ?: ""
-                        _uiState.value =
-                            _uiState.value.copy(
-                                isUploading = true,
-                                uploadProgress =
+                        val bytesUploaded = workInfo.progress.getLong(UploadWorker.KEY_BYTES_UPLOADED, 0L)
+                        val totalBytes = workInfo.progress.getLong(UploadWorker.KEY_TOTAL_BYTES, 0L)
+
+                        updateTransfer(
+                            TransferInfo(
+                                id = transferId,
+                                fileName = fileName,
+                                type = TransferType.UPLOAD,
+                                progress = progress,
+                                bytesTransferred = bytesUploaded,
+                                totalBytes = totalBytes,
+                                status =
                                     when (status) {
-                                        UploadWorker.STATUS_PREPARING -> "Preparing $fileName..."
-                                        UploadWorker.STATUS_UPLOADING -> "Uploading $fileName ($progress%)"
-                                        else -> "Uploading $fileName..."
+                                        UploadWorker.STATUS_PREPARING -> "Preparing..."
+                                        UploadWorker.STATUS_UPLOADING -> "Uploading..."
+                                        else -> "Uploading..."
                                     },
-                                uploadProgressPercent = progress / 100f,
-                                showUploadDialog = false,
-                            )
+                            ),
+                        )
                     }
 
                     WorkInfo.State.SUCCEEDED -> {
-                        _uiState.value =
-                            _uiState.value.copy(
-                                isUploading = false,
-                                uploadProgress = "",
-                                uploadProgressPercent = 0f,
-                            )
+                        removeTransfer(transferId)
                         loadObjects()
                     }
 
                     WorkInfo.State.FAILED -> {
                         val error = workInfo.outputData.getString(UploadWorker.KEY_ERROR) ?: "Upload failed"
-                        _uiState.value =
-                            _uiState.value.copy(
-                                isUploading = false,
-                                uploadProgress = "",
-                                uploadProgressPercent = 0f,
+                        updateTransfer(
+                            TransferInfo(
+                                id = transferId,
+                                fileName = fileName,
+                                type = TransferType.UPLOAD,
+                                progress = 0,
+                                status = "Failed",
                                 error = error,
-                            )
+                            ),
+                        )
+                        // Remove after a delay so user can see the error
+                        viewModelScope.launch {
+                            kotlinx.coroutines.delay(3000)
+                            removeTransfer(transferId)
+                        }
                     }
 
                     WorkInfo.State.CANCELLED -> {
-                        _uiState.value =
-                            _uiState.value.copy(
-                                isUploading = false,
-                                uploadProgress = "",
-                                uploadProgressPercent = 0f,
-                            )
+                        removeTransfer(transferId)
                     }
 
                     else -> { /* ENQUEUED, BLOCKED - no action needed */ }
@@ -872,6 +971,11 @@ class ObjectsViewModel(
     fun downloadFileInBackground(obj: S3Object) {
         if (obj.isFolder) return
 
+        val transferId =
+            java.util.UUID
+                .randomUUID()
+                .toString()
+
         val inputData =
             DownloadWorker.createInputData(
                 bucketName = _uiState.value.bucketName,
@@ -879,18 +983,30 @@ class ObjectsViewModel(
                 fileName = obj.fileName,
                 fileSize = obj.size,
                 mimeType = obj.mimeType,
+                transferId = transferId,
             )
 
         val downloadRequest =
             OneTimeWorkRequestBuilder<DownloadWorker>()
                 .setInputData(inputData)
                 .addTag("download")
-                .addTag("download_${obj.key.hashCode()}")
+                .addTag("transfer_$transferId")
                 .build()
 
+        // Add to active transfers immediately
+        updateTransfer(
+            TransferInfo(
+                id = transferId,
+                fileName = obj.fileName,
+                type = TransferType.DOWNLOAD,
+                totalBytes = obj.size,
+                status = "Preparing...",
+            ),
+        )
+
         workManager.enqueueUniqueWork(
-            "download_${obj.key.hashCode()}",
-            ExistingWorkPolicy.REPLACE,
+            "download_$transferId",
+            ExistingWorkPolicy.KEEP,
             downloadRequest,
         )
 
@@ -904,63 +1020,63 @@ class ObjectsViewModel(
                         val bytesDownloaded = workInfo.progress.getLong(DownloadWorker.KEY_BYTES_DOWNLOADED, 0L)
                         val totalBytes = workInfo.progress.getLong(DownloadWorker.KEY_TOTAL_BYTES, obj.size)
 
-                        val mbDownloaded = bytesDownloaded / (1024 * 1024f)
-                        val mbTotal = totalBytes / (1024 * 1024f)
-
-                        _uiState.value =
-                            _uiState.value.copy(
-                                isDownloading = true,
-                                downloadProgress =
+                        updateTransfer(
+                            TransferInfo(
+                                id = transferId,
+                                fileName = obj.fileName,
+                                type = TransferType.DOWNLOAD,
+                                progress = progress,
+                                bytesTransferred = bytesDownloaded,
+                                totalBytes = totalBytes,
+                                status =
                                     when (status) {
-                                        DownloadWorker.STATUS_PREPARING -> {
-                                            "Preparing ${obj.fileName}..."
-                                        }
-
-                                        DownloadWorker.STATUS_DOWNLOADING -> {
-                                            "Downloading: %.1f / %.1f MB (%d%%)".format(mbDownloaded, mbTotal, progress)
-                                        }
-
-                                        else -> {
-                                            "Downloading ${obj.fileName}..."
-                                        }
+                                        DownloadWorker.STATUS_PREPARING -> "Preparing..."
+                                        DownloadWorker.STATUS_DOWNLOADING -> "Downloading..."
+                                        else -> "Downloading..."
                                     },
-                                downloadProgressPercent = progress / 100f,
-                            )
+                            ),
+                        )
                     }
 
                     WorkInfo.State.SUCCEEDED -> {
-                        _uiState.value =
-                            _uiState.value.copy(
-                                isDownloading = false,
-                                downloadProgress = "",
-                                downloadProgressPercent = 0f,
-                            )
+                        removeTransfer(transferId)
                     }
 
                     WorkInfo.State.FAILED -> {
                         val error = workInfo.outputData.getString(DownloadWorker.KEY_ERROR) ?: "Download failed"
-                        _uiState.value =
-                            _uiState.value.copy(
-                                isDownloading = false,
-                                downloadProgress = "",
-                                downloadProgressPercent = 0f,
+                        updateTransfer(
+                            TransferInfo(
+                                id = transferId,
+                                fileName = obj.fileName,
+                                type = TransferType.DOWNLOAD,
+                                progress = 0,
+                                status = "Failed",
                                 error = error,
-                            )
+                            ),
+                        )
+                        // Remove after a delay so user can see the error
+                        viewModelScope.launch {
+                            kotlinx.coroutines.delay(3000)
+                            removeTransfer(transferId)
+                        }
                     }
 
                     WorkInfo.State.CANCELLED -> {
-                        _uiState.value =
-                            _uiState.value.copy(
-                                isDownloading = false,
-                                downloadProgress = "",
-                                downloadProgressPercent = 0f,
-                            )
+                        removeTransfer(transferId)
                     }
 
                     else -> { /* ENQUEUED, BLOCKED - no action needed */ }
                 }
             }
         }
+    }
+
+    /**
+     * Cancel a specific transfer
+     */
+    fun cancelTransfer(transferId: String) {
+        workManager.cancelAllWorkByTag("transfer_$transferId")
+        removeTransfer(transferId)
     }
 
     /**
@@ -971,6 +1087,7 @@ class ObjectsViewModel(
         workManager.cancelAllWorkByTag("download")
         _uiState.value =
             _uiState.value.copy(
+                activeTransfers = emptyList(),
                 isUploading = false,
                 isDownloading = false,
                 uploadProgress = "",

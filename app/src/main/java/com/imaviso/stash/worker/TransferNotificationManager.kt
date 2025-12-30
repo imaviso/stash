@@ -21,8 +21,24 @@ class TransferNotificationManager(
         const val CHANNEL_NAME = "File Transfers"
         const val CHANNEL_DESCRIPTION = "Notifications for file uploads and downloads"
 
+        // Base notification IDs - actual IDs are computed from transfer ID hash
+        const val UPLOAD_NOTIFICATION_BASE = 2000
+        const val DOWNLOAD_NOTIFICATION_BASE = 3000
+
+        // Legacy IDs for backward compatibility
         const val UPLOAD_NOTIFICATION_ID = 1001
         const val DOWNLOAD_NOTIFICATION_ID = 1002
+
+        /**
+         * Generate a unique notification ID for a transfer
+         */
+        fun getNotificationId(
+            transferId: String,
+            isUpload: Boolean,
+        ): Int {
+            val base = if (isUpload) UPLOAD_NOTIFICATION_BASE else DOWNLOAD_NOTIFICATION_BASE
+            return base + (transferId.hashCode() and 0x7FFFFFFF) % 1000
+        }
     }
 
     private val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -100,11 +116,12 @@ class TransferNotificationManager(
             .setCategory(NotificationCompat.CATEGORY_PROGRESS)
 
     /**
-     * Show upload complete notification
+     * Show upload complete notification with unique ID
      */
     fun showUploadComplete(
         fileName: String,
         success: Boolean,
+        transferId: String? = null,
     ) {
         val notification =
             NotificationCompat
@@ -122,15 +139,22 @@ class TransferNotificationManager(
                 .setPriority(NotificationCompat.PRIORITY_DEFAULT)
                 .build()
 
-        notificationManager.notify(UPLOAD_NOTIFICATION_ID + fileName.hashCode(), notification)
+        val notificationId =
+            if (transferId != null) {
+                getNotificationId(transferId, true)
+            } else {
+                UPLOAD_NOTIFICATION_ID + fileName.hashCode()
+            }
+        notificationManager.notify(notificationId, notification)
     }
 
     /**
-     * Show download complete notification
+     * Show download complete notification with unique ID
      */
     fun showDownloadComplete(
         fileName: String,
         success: Boolean,
+        transferId: String? = null,
     ) {
         val notification =
             NotificationCompat
@@ -148,7 +172,13 @@ class TransferNotificationManager(
                 .setPriority(NotificationCompat.PRIORITY_DEFAULT)
                 .build()
 
-        notificationManager.notify(DOWNLOAD_NOTIFICATION_ID + fileName.hashCode(), notification)
+        val notificationId =
+            if (transferId != null) {
+                getNotificationId(transferId, false)
+            } else {
+                DOWNLOAD_NOTIFICATION_ID + fileName.hashCode()
+            }
+        notificationManager.notify(notificationId, notification)
     }
 
     /**

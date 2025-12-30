@@ -37,6 +37,7 @@ class UploadWorker(
         const val KEY_FILE_URI = "file_uri"
         const val KEY_CONTENT_TYPE = "content_type"
         const val KEY_FILE_NAME = "file_name"
+        const val KEY_TRANSFER_ID = "transfer_id"
 
         // Output/Progress data keys
         const val KEY_PROGRESS = "progress"
@@ -57,6 +58,10 @@ class UploadWorker(
             fileUri: String,
             contentType: String,
             fileName: String,
+            transferId: String =
+                java.util.UUID
+                    .randomUUID()
+                    .toString(),
         ): Data =
             workDataOf(
                 KEY_BUCKET_NAME to bucketName,
@@ -64,6 +69,7 @@ class UploadWorker(
                 KEY_FILE_URI to fileUri,
                 KEY_CONTENT_TYPE to contentType,
                 KEY_FILE_NAME to fileName,
+                KEY_TRANSFER_ID to transferId,
             )
     }
 
@@ -86,8 +92,12 @@ class UploadWorker(
                 )
             val contentType = inputData.getString(KEY_CONTENT_TYPE) ?: "application/octet-stream"
             val fileName = inputData.getString(KEY_FILE_NAME) ?: objectKey.substringAfterLast('/')
+            val transferId =
+                inputData.getString(KEY_TRANSFER_ID) ?: java.util.UUID
+                    .randomUUID()
+                    .toString()
 
-            Log.d(TAG, "Starting upload: $fileName to $bucketName/$objectKey")
+            Log.d(TAG, "Starting upload: $fileName to $bucketName/$objectKey (transferId: $transferId)")
 
             try {
                 // Get S3 config
@@ -99,7 +109,7 @@ class UploadWorker(
                 }
 
                 // Set as foreground with notification
-                setForeground(createForegroundInfo(fileName, 0))
+                setForeground(createForegroundInfo(fileName, 0, transferId))
 
                 // Copy URI content to temp file
                 setProgress(
@@ -136,7 +146,7 @@ class UploadWorker(
                         KEY_TOTAL_BYTES to totalBytes,
                     ),
                 )
-                setForeground(createForegroundInfo(fileName, 10))
+                setForeground(createForegroundInfo(fileName, 10, transferId))
 
                 // Create S3 client and upload
                 val s3Client =
@@ -164,7 +174,7 @@ class UploadWorker(
                     Log.d(TAG, "Upload complete: $fileName")
 
                     // Show completion notification
-                    notificationManager.showUploadComplete(fileName, true)
+                    notificationManager.showUploadComplete(fileName, true, transferId)
 
                     Result.success(
                         workDataOf(
@@ -180,7 +190,7 @@ class UploadWorker(
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Upload failed: ${e.message}", e)
-                notificationManager.showUploadComplete(fileName, false)
+                notificationManager.showUploadComplete(fileName, false, transferId)
                 Result.failure(
                     workDataOf(
                         KEY_STATUS to STATUS_FAILED,
@@ -193,6 +203,7 @@ class UploadWorker(
     private fun createForegroundInfo(
         fileName: String,
         progress: Int,
+        transferId: String,
     ): ForegroundInfo {
         val notification =
             notificationManager
@@ -202,15 +213,17 @@ class UploadWorker(
                     isIndeterminate = progress == 0,
                 ).build()
 
+        val notificationId = TransferNotificationManager.getNotificationId(transferId, true)
+
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             ForegroundInfo(
-                TransferNotificationManager.UPLOAD_NOTIFICATION_ID,
+                notificationId,
                 notification,
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
             )
         } else {
             ForegroundInfo(
-                TransferNotificationManager.UPLOAD_NOTIFICATION_ID,
+                notificationId,
                 notification,
             )
         }
