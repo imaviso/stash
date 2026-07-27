@@ -28,12 +28,7 @@ sealed class Screen(
         }
     }
 
-    data object Transfers : Screen("transfers/{bucketName}") {
-        fun createRoute(bucketName: String): String {
-            val encoded = URLEncoder.encode(bucketName, StandardCharsets.UTF_8.toString())
-            return "transfers/$encoded"
-        }
-    }
+    data object Transfers : Screen("transfers")
 }
 
 @Composable
@@ -49,6 +44,9 @@ fun S3NavHost(navController: NavHostController) {
                 },
                 onNavigateToBucket = { bucketName ->
                     navController.navigate(Screen.Objects.createRoute(bucketName))
+                },
+                onNavigateToTransfers = {
+                    navController.navigate(Screen.Transfers.route)
                 },
             )
         }
@@ -75,6 +73,12 @@ fun S3NavHost(navController: NavHostController) {
                 onNavigateBack = {
                     navController.popBackStack()
                 },
+            )
+        }
+
+        composable(Screen.Transfers.route) {
+            TransfersScreen(
+                onNavigateBack = { navController.popBackStack() },
             )
         }
     }

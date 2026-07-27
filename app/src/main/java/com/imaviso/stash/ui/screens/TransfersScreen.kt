@@ -12,17 +12,24 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.imaviso.stash.ui.viewmodel.TransferInfo
-import com.imaviso.stash.ui.viewmodel.TransferType
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.imaviso.stash.data.repository.TransferInfo
+import com.imaviso.stash.data.repository.TransferState
+import com.imaviso.stash.data.repository.TransferType
+import com.imaviso.stash.ui.viewmodel.TransfersViewModel
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TransfersScreen(
-    activeTransfers: List<TransferInfo>,
     onNavigateBack: () -> Unit,
-    onCancelTransfer: (String) -> Unit,
-    onCancelAll: () -> Unit,
+    viewModel: TransfersViewModel = viewModel(),
 ) {
+    val activeTransfers by viewModel.activeTransfers.collectAsState()
+    val historyTransfers by viewModel.historyTransfers.collectAsState()
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -34,16 +41,19 @@ fun TransfersScreen(
                 },
                 actions = {
                     if (activeTransfers.isNotEmpty()) {
-                        TextButton(onClick = onCancelAll) {
+                        TextButton(onClick = viewModel::cancelAll) {
                             Text("Cancel All")
+                        }
+                    } else if (historyTransfers.isNotEmpty()) {
+                        TextButton(onClick = viewModel::clearHistory) {
+                            Text("Clear History")
                         }
                     }
                 },
             )
         },
     ) { padding ->
-        if (activeTransfers.isEmpty()) {
-            // Empty state
+        if (activeTransfers.isEmpty() && historyTransfers.isEmpty()) {
             Box(
                 modifier =
                     Modifier
@@ -63,7 +73,7 @@ fun TransfersScreen(
                     )
                     Spacer(modifier = Modifier.height(16.dp))
                     Text(
-                        "No Active Transfers",
+                        "No Transfers",
                         style = MaterialTheme.typography.headlineSmall,
                     )
                     Spacer(modifier = Modifier.height(8.dp))
@@ -83,11 +93,29 @@ fun TransfersScreen(
                 contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                items(activeTransfers, key = { it.id }) { transfer ->
-                    TransferItem(
-                        transfer = transfer,
-                        onCancel = { onCancelTransfer(transfer.id) },
-                    )
+                if (activeTransfers.isNotEmpty()) {
+                    item {
+                        SectionHeader("Active (${activeTransfers.size})")
+                    }
+                    items(activeTransfers, key = { it.id }) { transfer ->
+                        TransferItem(
+                            transfer = transfer,
+                            onCancel = { viewModel.cancelTransfer(transfer.id) },
+                        )
+                    }
+                }
+
+                if (historyTransfers.isNotEmpty()) {
+                    item {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        SectionHeader("History")
+                    }
+                    items(historyTransfers, key = { it.id }) { transfer ->
+                        TransferItem(
+                            transfer = transfer,
+                            onCancel = null,
+                        )
+                    }
                 }
             }
         }
@@ -95,12 +123,31 @@ fun TransfersScreen(
 }
 
 @Composable
+private fun SectionHeader(text: String) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.titleSmall,
+        color = MaterialTheme.colorScheme.primary,
+    )
+}
+
+@Composable
 private fun TransferItem(
     transfer: TransferInfo,
-    onCancel: () -> Unit,
+    onCancel: (() -> Unit)?,
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
+        colors =
+            CardDefaults.cardColors(
+                containerColor =
+                    when (transfer.state) {
+                        TransferState.COMPLETED -> MaterialTheme.colorScheme.primaryContainer
+                        TransferState.FAILED -> MaterialTheme.colorScheme.errorContainer
+                        TransferState.CANCELLED -> MaterialTheme.colorScheme.surfaceVariant
+                        else -> MaterialTheme.colorScheme.surface
+                    },
+            ),
     ) {
         Column(
             modifier =
@@ -126,10 +173,10 @@ private fun TransferItem(
                             },
                         contentDescription = null,
                         tint =
-                            if (transfer.error != null) {
-                                MaterialTheme.colorScheme.error
-                            } else {
-                                MaterialTheme.colorScheme.primary
+                            when (transfer.state) {
+                                TransferState.FAILED -> MaterialTheme.colorScheme.error
+                                TransferState.COMPLETED -> MaterialTheme.colorScheme.primary
+                                else -> MaterialTheme.colorScheme.onSurfaceVariant
                             },
                         modifier = Modifier.size(24.dp),
                     )
@@ -142,7 +189,7 @@ private fun TransferItem(
                             overflow = TextOverflow.Ellipsis,
                         )
                         Text(
-                            text = transfer.status,
+                            text = transfer.status.ifBlank { transfer.state.name.lowercase().replaceFirstChar { it.uppercase() } },
                             style = MaterialTheme.typography.bodySmall,
                             color =
                                 if (transfer.error != null) {
@@ -151,34 +198,40 @@ private fun TransferItem(
                                     MaterialTheme.colorScheme.onSurfaceVariant
                                 },
                         )
+                        if (transfer.state != TransferState.ACTIVE) {
+                            Text(
+                                text = remember(transfer.timestamp) {
+                                    SimpleDateFormat("MMM dd, HH:mm", Locale.getDefault()).format(Date(transfer.timestamp))
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                     }
                 }
 
-                // Cancel button
-                if (transfer.error == null) {
+                if (onCancel != null && transfer.error == null) {
                     IconButton(
                         onClick = onCancel,
-                        modifier = Modifier.size(32.dp),
+                        modifier = Modifier.size(48.dp),
                     ) {
                         Icon(
                             Icons.Default.Close,
                             contentDescription = "Cancel",
-                            modifier = Modifier.size(18.dp),
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                 }
             }
 
-            // Progress bar
-            if (transfer.error == null) {
+            // Progress bar (only for active transfers with meaningful progress)
+            if (transfer.state == TransferState.ACTIVE) {
                 Spacer(modifier = Modifier.height(8.dp))
                 LinearProgressIndicator(
                     progress = { transfer.progress / 100f },
                     modifier = Modifier.fillMaxWidth(),
                 )
 
-                // Size info
                 if (transfer.totalBytes > 0) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Row(
@@ -204,7 +257,6 @@ private fun TransferItem(
                 }
             }
 
-            // Error message
             transfer.error?.let { error ->
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(

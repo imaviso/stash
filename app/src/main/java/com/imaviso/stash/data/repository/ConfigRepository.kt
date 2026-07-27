@@ -42,6 +42,9 @@ class ConfigRepository(
 
         // Navigation state - stores last path per bucket as JSON
         private val BUCKET_PATHS_JSON = stringPreferencesKey("bucket_paths_json")
+
+        // App lock (biometric) setting
+        private val APP_LOCK_ENABLED = booleanPreferencesKey("app_lock_enabled")
     }
 
     // Encrypted SharedPreferences for secure credential storage
@@ -315,6 +318,15 @@ class ConfigRepository(
         }
 
     // ==================== NAVIGATION STATE ====================
+
+    // ==================== APP LOCK ====================
+
+    val appLockEnabledFlow: Flow<Boolean> =
+        context.dataStore.data.map { prefs -> prefs[APP_LOCK_ENABLED] ?: false }
+
+    suspend fun setAppLockEnabled(enabled: Boolean) {
+        context.dataStore.edit { prefs -> prefs[APP_LOCK_ENABLED] = enabled }
+    }
 
     /**
      * Data class to hold navigation state for a bucket

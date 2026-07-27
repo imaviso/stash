@@ -100,6 +100,9 @@ fun FilePreviewScreen(
     onPageChanged: (Int) -> Unit,
     onDownload: (S3Object) -> Unit,
     onDelete: (S3Object) -> Unit,
+    onShare: ((S3Object) -> Unit)? = null,
+    onRename: ((S3Object) -> Unit)? = null,
+    onDetails: ((S3Object) -> Unit)? = null,
     onOpenWith: ((S3Object, File) -> Unit)? = null,
 ) {
     val context = LocalContext.current
@@ -154,16 +157,20 @@ fun FilePreviewScreen(
                     }
                 },
                 actions = {
+                    var showOverflow by remember { androidx.compose.runtime.mutableStateOf(false) }
                     // Open with button - shown only when we have file data
                     if (fileData != null) {
                         IconButton(
                             onClick = {
-                                // Write to temp file and open
                                 try {
                                     val sharedDir = File(context.cacheDir, "shared").apply { mkdirs() }
                                     val tempFile = File(sharedDir, currentObject.fileName)
                                     tempFile.writeBytes(fileData)
-                                    openWithExternalApp(context, tempFile, currentObject.mimeType)
+                                    if (onOpenWith != null) {
+                                        onOpenWith(currentObject, tempFile)
+                                    } else {
+                                        openWithExternalApp(context, tempFile, currentObject.mimeType)
+                                    }
                                 } catch (e: Exception) {
                                     Toast.makeText(context, "Failed to open: ${e.message}", Toast.LENGTH_SHORT).show()
                                 }
@@ -175,8 +182,61 @@ fun FilePreviewScreen(
                     IconButton(onClick = { onDownload(currentObject) }) {
                         Icon(Icons.Default.Download, contentDescription = "Download")
                     }
-                    IconButton(onClick = { onDelete(currentObject) }) {
-                        Icon(Icons.Default.Delete, contentDescription = "Delete")
+                    // Overflow: share link, rename, details, delete
+                    Box {
+                        IconButton(onClick = { showOverflow = true }) {
+                            Icon(Icons.Default.MoreVert, contentDescription = "More options")
+                        }
+                        androidx.compose.material3.DropdownMenu(
+                            expanded = showOverflow,
+                            onDismissRequest = { showOverflow = false },
+                        ) {
+                            if (onShare != null) {
+                                androidx.compose.material3.DropdownMenuItem(
+                                    text = { Text("Share link") },
+                                    onClick = {
+                                        showOverflow = false
+                                        onShare(currentObject)
+                                    },
+                                    leadingIcon = { Icon(Icons.Default.Share, contentDescription = null) },
+                                )
+                            }
+                            if (onRename != null) {
+                                androidx.compose.material3.DropdownMenuItem(
+                                    text = { Text("Rename") },
+                                    onClick = {
+                                        showOverflow = false
+                                        onRename(currentObject)
+                                    },
+                                    leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null) },
+                                )
+                            }
+                            if (onDetails != null) {
+                                androidx.compose.material3.DropdownMenuItem(
+                                    text = { Text("Details") },
+                                    onClick = {
+                                        showOverflow = false
+                                        onDetails(currentObject)
+                                    },
+                                    leadingIcon = { Icon(Icons.Default.Info, contentDescription = null) },
+                                )
+                            }
+                            androidx.compose.material3.HorizontalDivider()
+                            androidx.compose.material3.DropdownMenuItem(
+                                text = { Text("Delete") },
+                                onClick = {
+                                    showOverflow = false
+                                    onDelete(currentObject)
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        Icons.Default.Delete,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.error,
+                                    )
+                                },
+                            )
+                        }
                     }
                 },
             )

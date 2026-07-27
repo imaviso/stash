@@ -6,6 +6,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.ExperimentalMaterialApi
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.pullrefresh.PullRefreshIndicator
 import androidx.compose.material.pullrefresh.pullRefresh
@@ -19,6 +20,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.imaviso.stash.data.model.S3Account
 import com.imaviso.stash.data.model.S3Bucket
+import com.imaviso.stash.ui.viewmodel.BucketSortOption
 import com.imaviso.stash.ui.viewmodel.BucketsViewModel
 import java.text.SimpleDateFormat
 import java.util.*
@@ -28,10 +30,14 @@ import java.util.*
 fun BucketsScreen(
     onNavigateToConfig: () -> Unit,
     onNavigateToBucket: (String) -> Unit,
+    onNavigateToTransfers: () -> Unit,
     viewModel: BucketsViewModel = viewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
+    val activeCountState =
+        com.imaviso.stash.data.repository.TransferRepository.transfers.collectAsState()
+    val activeCount = activeCountState.value.count { it.state == com.imaviso.stash.data.repository.TransferState.ACTIVE }
 
     val pullRefreshState =
         rememberPullRefreshState(
@@ -57,11 +63,64 @@ fun BucketsScreen(
                                 text = account.name,
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier =
+                                    Modifier
+                                        .clickable { viewModel.showAccountPicker() },
                             )
                         }
                     }
                 },
                 actions = {
+                    // Transfers entry point with active-count badge
+                    BadgedBox(
+                        badge = {
+                            if (activeCount > 0) {
+                                Badge { Text(activeCount.toString()) }
+                            }
+                        },
+                    ) {
+                        IconButton(onClick = onNavigateToTransfers) {
+                            Icon(Icons.Default.SwapVert, contentDescription = "Transfers")
+                        }
+                    }
+                    // Bucket sort menu
+                    var showSortMenu by remember { mutableStateOf(false) }
+                    Box {
+                        IconButton(onClick = { showSortMenu = true }) {
+                            Icon(Icons.AutoMirrored.Filled.Sort, contentDescription = "Sort")
+                        }
+                        DropdownMenu(
+                            expanded = showSortMenu,
+                            onDismissRequest = { showSortMenu = false },
+                        ) {
+                            BucketSortOption.entries.forEach { option ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        ) {
+                                            if (uiState.sortOption == option) {
+                                                Icon(
+                                                    Icons.Default.Check,
+                                                    contentDescription = null,
+                                                    modifier = Modifier.size(18.dp),
+                                                    tint = MaterialTheme.colorScheme.primary,
+                                                )
+                                            } else {
+                                                Spacer(modifier = Modifier.size(18.dp))
+                                            }
+                                            Text(option.displayName)
+                                        }
+                                    },
+                                    onClick = {
+                                        viewModel.setSortOption(option)
+                                        showSortMenu = false
+                                    },
+                                )
+                            }
+                        }
+                    }
                     IconButton(onClick = onNavigateToConfig) {
                         Icon(Icons.Default.Settings, contentDescription = "Settings")
                     }
@@ -94,16 +153,21 @@ fun BucketsScreen(
                 }
 
                 else -> {
+                    val sortedBuckets =
+                        remember(uiState.buckets, uiState.sortOption) {
+                            viewModel.sortBuckets(uiState.buckets)
+                        }
                     LazyColumn(
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(16.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        items(uiState.buckets) { bucket ->
+                        items(sortedBuckets, key = { it.name }) { bucket ->
                             BucketItem(
                                 bucket = bucket,
                                 onClick = { onNavigateToBucket(bucket.name) },
                                 onDelete = { viewModel.showDeleteDialog(bucket) },
+                                onShowStats = { viewModel.showBucketStats(bucket) },
                             )
                         }
                     }
@@ -138,6 +202,87 @@ fun BucketsScreen(
             isDeleting = uiState.isDeleting,
         )
     }
+
+    // Account Picker Dialog
+    if (uiState.showAccountPicker) {
+        AccountPickerDialog(
+            accounts = uiState.accounts,
+            activeAccountId = uiState.activeAccount?.id,
+            onSelectAccount = viewModel::switchAccount,
+            onDismiss = viewModel::hideAccountPicker,
+        )
+    }
+
+    // Bucket Stats Dialog
+    if (uiState.showStatsDialog && uiState.statsBucket != null) {
+        BucketStatsDialog(
+            bucketName = uiState.statsBucket!!.name,
+            stats = uiState.bucketStats,
+            isLoading = uiState.isLoadingStats,
+            onDismiss = viewModel::hideBucketStats,
+        )
+    }
+}
+
+@Composable
+private fun BucketStatsDialog(
+    bucketName: String,
+    stats: com.imaviso.stash.ui.viewmodel.BucketStats?,
+    isLoading: Boolean,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Bucket Stats") },
+        text = {
+            if (isLoading) {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    CircularProgressIndicator()
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text("Scanning $bucketName...")
+                }
+            } else if (stats != null) {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors =
+                            CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.primaryContainer,
+                            ),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(16.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            Text(
+                                text = stats.formattedSize,
+                                style = MaterialTheme.typography.headlineMedium,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            )
+                            Text(
+                                text = "${stats.fileCount} files, ${stats.folderCount} folders",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f),
+                            )
+                        }
+                    }
+                }
+            } else {
+                Text("No data available")
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Close")
+            }
+        },
+    )
 }
 
 @Composable
@@ -305,6 +450,7 @@ private fun BucketItem(
     bucket: S3Bucket,
     onClick: () -> Unit,
     onDelete: () -> Unit,
+    onShowStats: () -> Unit,
 ) {
     val dateFormat = remember { SimpleDateFormat("MMM dd, yyyy", Locale.getDefault()) }
 
@@ -348,12 +494,46 @@ private fun BucketItem(
                     }
                 }
             }
-            IconButton(onClick = onDelete) {
-                Icon(
-                    imageVector = Icons.Default.Delete,
-                    contentDescription = "Delete",
-                    tint = MaterialTheme.colorScheme.error,
-                )
+            // Overflow: stats + delete
+            var showMenu by remember { mutableStateOf(false) }
+            Box {
+                IconButton(onClick = { showMenu = true }) {
+                    Icon(
+                        imageVector = Icons.Default.MoreVert,
+                        contentDescription = "More options",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                DropdownMenu(
+                    expanded = showMenu,
+                    onDismissRequest = { showMenu = false },
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("Bucket stats") },
+                        onClick = {
+                            showMenu = false
+                            onShowStats()
+                        },
+                        leadingIcon = {
+                            Icon(Icons.Default.PieChart, contentDescription = null)
+                        },
+                    )
+                    HorizontalDivider()
+                    DropdownMenuItem(
+                        text = { Text("Delete bucket") },
+                        onClick = {
+                            showMenu = false
+                            onDelete()
+                        },
+                        leadingIcon = {
+                            Icon(
+                                Icons.Default.Delete,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.error,
+                            )
+                        },
+                    )
+                }
             }
         }
     }

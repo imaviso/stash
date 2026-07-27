@@ -67,11 +67,13 @@ import com.imaviso.stash.ui.viewmodel.ObjectsViewModel
 import com.imaviso.stash.ui.viewmodel.ShareExpiration
 import com.imaviso.stash.ui.viewmodel.SortOption
 import com.imaviso.stash.ui.viewmodel.StorageStats
-import com.imaviso.stash.ui.viewmodel.TransferType
+import com.imaviso.stash.data.repository.TransferInfo
+import com.imaviso.stash.data.repository.TransferType
 import com.imaviso.stash.ui.viewmodel.ViewMode
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
@@ -87,6 +89,10 @@ fun ObjectsScreen(
     val uiState by viewModel.uiState.collectAsState()
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
+    val screenScope = rememberCoroutineScope()
+    val showMessage: (String) -> Unit = { msg ->
+        screenScope.launch { snackbarHostState.showSnackbar(msg) }
+    }
     val keyboardController = LocalSoftwareKeyboardController.current
     val searchFocusRequester = remember { FocusRequester() }
 
@@ -108,16 +114,20 @@ fun ObjectsScreen(
 
     // Get filtered and sorted objects from ViewModel
     val displayObjects =
-        remember(uiState.objects, uiState.searchQuery, uiState.sortOption) {
-            val filtered =
-                if (uiState.searchQuery.isBlank()) {
-                    uiState.objects
-                } else {
-                    uiState.objects.filter { obj ->
-                        obj.fileName.contains(uiState.searchQuery, ignoreCase = true)
+        remember(uiState.objects, uiState.searchQuery, uiState.sortOption, uiState.recursiveResults, uiState.isSearchRecursive) {
+            if (uiState.isSearchRecursive && uiState.searchQuery.isNotBlank()) {
+                uiState.recursiveResults
+            } else {
+                val filtered =
+                    if (uiState.searchQuery.isBlank()) {
+                        uiState.objects
+                    } else {
+                        uiState.objects.filter { obj ->
+                            obj.fileName.contains(uiState.searchQuery, ignoreCase = true)
+                        }
                     }
-                }
-            viewModel.sortObjects(filtered)
+                viewModel.sortObjects(filtered)
+            }
         }
 
     val pullRefreshState =
@@ -132,7 +142,7 @@ fun ObjectsScreen(
             contract = ActivityResultContracts.OpenMultipleDocuments(),
         ) { uris: List<Uri> ->
             uris.forEach { uri ->
-                handleFileUpload(context, uri, viewModel)
+                handleFileUpload(context, uri, viewModel)?.let { showMessage(it) }
             }
         }
 
@@ -144,6 +154,36 @@ fun ObjectsScreen(
         uiState.error?.let { error ->
             snackbarHostState.showSnackbar(error)
             viewModel.clearError()
+        }
+    }
+
+    // Snackbar events with optional action (e.g. Undo). Action snacks auto-dismiss
+    // after the undo window so they don't linger after the delete commits.
+    LaunchedEffect(Unit) {
+        viewModel.snackbarEvents.collect { event ->
+            if (event.actionLabel != null) {
+                val result =
+                    snackbarHostState.showSnackbar(
+                        message = event.message,
+                        actionLabel = event.actionLabel,
+                        duration = SnackbarDuration.Indefinite,
+                    )
+                if (result == SnackbarResult.ActionPerformed) {
+                    event.onAction?.invoke()
+                }
+            } else {
+                snackbarHostState.showSnackbar(
+                    message = event.message,
+                    duration = SnackbarDuration.Short,
+                )
+            }
+        }
+    }
+
+    // Dismiss the undo snackbar when the pending delete clears (commit or undo).
+    LaunchedEffect(uiState.pendingDeleteObject) {
+        if (uiState.pendingDeleteObject == null) {
+            snackbarHostState.currentSnackbarData?.dismiss()
         }
     }
 
@@ -216,13 +256,25 @@ fun ObjectsScreen(
                     viewModel.downloadFileInBackground(obj)
                 } else {
                     uiState.previewData?.let { data ->
-                        saveFile(context, obj.fileName, data)
+                        showMessage(saveFile(obj.fileName, data))
                     }
                 }
             },
             onDelete = { obj ->
                 viewModel.showDeleteDialog(obj)
                 viewModel.closePreview()
+            },
+            onShare = { obj ->
+                viewModel.showShareDialog(obj)
+            },
+            onRename = { obj ->
+                viewModel.showRenameDialog(obj)
+            },
+            onDetails = { obj ->
+                viewModel.showDetailsDialog(obj)
+            },
+            onOpenWith = { obj, file ->
+                openFileWithExternalApp(context, file, obj.mimeType)?.let { showMessage(it) }
             },
         )
         return
@@ -261,6 +313,20 @@ fun ObjectsScreen(
                         }
                     },
                     actions = {
+                        // Recursive search toggle
+                        IconButton(onClick = { viewModel.toggleSearchRecursive() }) {
+                            Icon(
+                                imageVector = if (uiState.isSearchRecursive) Icons.Default.FolderOff else Icons.Default.FolderOpen,
+                                contentDescription = if (uiState.isSearchRecursive) "Search this folder only" else "Search recursively",
+                                tint = if (uiState.isSearchRecursive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        if (uiState.isSearchingRecursive) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                strokeWidth = 2.dp,
+                            )
+                        }
                         if (uiState.searchQuery.isNotEmpty()) {
                             IconButton(onClick = { viewModel.setSearchQuery("") }) {
                                 Icon(Icons.Default.Clear, contentDescription = "Clear")
@@ -525,7 +591,18 @@ fun ObjectsScreen(
                 }
 
                 if (displayObjects.isEmpty() && !uiState.isLoading) {
-                    if (uiState.searchQuery.isNotEmpty()) {
+                    if (uiState.isSearchingRecursive) {
+                        Box(
+                            modifier = Modifier.fillMaxSize(),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                CircularProgressIndicator()
+                                Spacer(modifier = Modifier.height(16.dp))
+                                Text("Searching recursively...")
+                            }
+                        }
+                    } else if (uiState.searchQuery.isNotEmpty()) {
                         NoSearchResultsView(query = uiState.searchQuery)
                     } else {
                         EmptyObjectsView()
@@ -562,9 +639,7 @@ fun ObjectsScreen(
                                     onClick = {
                                         when {
                                             uiState.isMultiSelectMode -> {
-                                                if (!obj.isFolder) {
-                                                    viewModel.toggleObjectSelection(obj)
-                                                }
+                                                viewModel.toggleObjectSelection(obj)
                                             }
 
                                             obj.isFolder -> {
@@ -577,7 +652,7 @@ fun ObjectsScreen(
                                         }
                                     },
                                     onLongClick = {
-                                        if (!obj.isFolder && !uiState.isMultiSelectMode) {
+                                        if (!uiState.isMultiSelectMode) {
                                             viewModel.toggleMultiSelectMode()
                                             viewModel.toggleObjectSelection(obj)
                                         }
@@ -589,13 +664,13 @@ fun ObjectsScreen(
                                             viewModel.downloadFileInBackground(obj)
                                         } else {
                                             viewModel.downloadObject(obj) { data ->
-                                                saveFile(context, obj.fileName, data)
+                                                showMessage(saveFile(obj.fileName, data))
                                             }
                                         }
                                     },
                                     onOpenWith = {
                                         viewModel.downloadForOpenWith(obj) { file ->
-                                            openFileWithExternalApp(context, file, obj.mimeType)
+                                            openFileWithExternalApp(context, file, obj.mimeType)?.let { showMessage(it) }
                                         }
                                     },
                                     onShare = { viewModel.showShareDialog(obj) },
@@ -643,9 +718,7 @@ fun ObjectsScreen(
                                     onClick = {
                                         when {
                                             uiState.isMultiSelectMode -> {
-                                                if (!obj.isFolder) {
-                                                    viewModel.toggleObjectSelection(obj)
-                                                }
+                                                viewModel.toggleObjectSelection(obj)
                                             }
 
                                             obj.isFolder -> {
@@ -658,11 +731,35 @@ fun ObjectsScreen(
                                         }
                                     },
                                     onLongClick = {
-                                        if (!obj.isFolder && !uiState.isMultiSelectMode) {
+                                        if (!uiState.isMultiSelectMode) {
                                             viewModel.toggleMultiSelectMode()
                                             viewModel.toggleObjectSelection(obj)
                                         }
                                     },
+                                    onDownload = {
+                                        if (obj.size > 5 * 1024 * 1024) {
+                                            viewModel.downloadFileInBackground(obj)
+                                        } else {
+                                            viewModel.downloadObject(obj) { data ->
+                                                showMessage(saveFile(obj.fileName, data))
+                                            }
+                                        }
+                                    },
+                                    onOpenWith = {
+                                        viewModel.downloadForOpenWith(obj) { file ->
+                                            openFileWithExternalApp(context, file, obj.mimeType)?.let { showMessage(it) }
+                                        }
+                                    },
+                                    onShare = { viewModel.showShareDialog(obj) },
+                                    onRename = { viewModel.showRenameDialog(obj) },
+                                    onDetails = { viewModel.showDetailsDialog(obj) },
+                                    onDelete = { viewModel.showDeleteDialog(obj) },
+                                    onDownloadFolder =
+                                        if (obj.isFolder) {
+                                            { viewModel.downloadFolderRecursively(obj) }
+                                        } else {
+                                            null
+                                        },
                                 )
                             }
                         }
@@ -773,6 +870,7 @@ fun ObjectsScreen(
             isGenerating = uiState.isGeneratingShareUrl,
             onGenerateUrl = { expiration -> viewModel.generateShareUrl(expiration) },
             onDismiss = { viewModel.hideShareDialog() },
+            onShowMessage = showMessage,
         )
     }
 
@@ -863,7 +961,6 @@ private fun ClipboardIndicator(
             }
             IconButton(
                 onClick = onClear,
-                modifier = Modifier.size(24.dp),
             ) {
                 Icon(
                     Icons.Default.Close,
@@ -964,8 +1061,8 @@ private fun ObjectItem(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // Checkbox for multi-select (files only)
-            if (isMultiSelectMode && !obj.isFolder) {
+            // Checkbox for multi-select (files and folders)
+            if (isMultiSelectMode) {
                 Checkbox(
                     checked = isSelected,
                     onCheckedChange = { onClick() },
@@ -1619,6 +1716,13 @@ private fun ObjectGridItem(
     thumbnailUrl: String?,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
+    onDownload: () -> Unit = {},
+    onOpenWith: () -> Unit = {},
+    onShare: () -> Unit = {},
+    onRename: () -> Unit = {},
+    onDetails: () -> Unit = {},
+    onDelete: () -> Unit = {},
+    onDownloadFolder: (() -> Unit)? = null,
 ) {
     // Color contrast fix: use proper colors based on selection state
     val contentColor =
@@ -1735,7 +1839,7 @@ private fun ObjectGridItem(
             }
 
             // Checkbox overlay for multi-select
-            if (isMultiSelectMode && !obj.isFolder) {
+            if (isMultiSelectMode) {
                 Checkbox(
                     checked = isSelected,
                     onCheckedChange = { onClick() },
@@ -1744,6 +1848,124 @@ private fun ObjectGridItem(
                             .align(Alignment.TopEnd)
                             .padding(4.dp),
                 )
+            } else {
+                // Overflow menu (parity with list view)
+                var showMenu by remember { mutableStateOf(false) }
+                Box(
+                    modifier =
+                        Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(2.dp),
+                ) {
+                    IconButton(
+                        onClick = { showMenu = true },
+                        modifier = Modifier.size(48.dp),
+                    ) {
+                        Icon(
+                            Icons.Default.MoreVert,
+                            contentDescription = "More options",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = showMenu,
+                        onDismissRequest = { showMenu = false },
+                    ) {
+                        if (obj.isFolder) {
+                            if (onDownloadFolder != null) {
+                                DropdownMenuItem(
+                                    text = { Text("Download folder") },
+                                    onClick = {
+                                        showMenu = false
+                                        onDownloadFolder()
+                                    },
+                                    leadingIcon = { Icon(Icons.Default.FolderZip, contentDescription = null) },
+                                )
+                            }
+                            DropdownMenuItem(
+                                text = { Text("Details") },
+                                onClick = {
+                                    showMenu = false
+                                    onDetails()
+                                },
+                                leadingIcon = { Icon(Icons.Default.Info, contentDescription = null) },
+                            )
+                            HorizontalDivider()
+                            DropdownMenuItem(
+                                text = { Text("Delete folder") },
+                                onClick = {
+                                    showMenu = false
+                                    onDelete()
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        Icons.Default.DeleteForever,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.error,
+                                    )
+                                },
+                            )
+                        } else {
+                            DropdownMenuItem(
+                                text = { Text("Share link") },
+                                onClick = {
+                                    showMenu = false
+                                    onShare()
+                                },
+                                leadingIcon = { Icon(Icons.Default.Share, contentDescription = null) },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Open with") },
+                                onClick = {
+                                    showMenu = false
+                                    onOpenWith()
+                                },
+                                leadingIcon = { Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null) },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Download") },
+                                onClick = {
+                                    showMenu = false
+                                    onDownload()
+                                },
+                                leadingIcon = { Icon(Icons.Default.Download, contentDescription = null) },
+                            )
+                            HorizontalDivider()
+                            DropdownMenuItem(
+                                text = { Text("Rename") },
+                                onClick = {
+                                    showMenu = false
+                                    onRename()
+                                },
+                                leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null) },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Details") },
+                                onClick = {
+                                    showMenu = false
+                                    onDetails()
+                                },
+                                leadingIcon = { Icon(Icons.Default.Info, contentDescription = null) },
+                            )
+                            HorizontalDivider()
+                            DropdownMenuItem(
+                                text = { Text("Delete") },
+                                onClick = {
+                                    showMenu = false
+                                    onDelete()
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        Icons.Default.Delete,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.error,
+                                    )
+                                },
+                            )
+                        }
+                    }
+                }
             }
         }
     }
@@ -1753,8 +1975,8 @@ private fun handleFileUpload(
     context: Context,
     uri: Uri,
     viewModel: ObjectsViewModel,
-) {
-    try {
+): String? {
+    return try {
         val contentResolver = context.contentResolver
         val fileName = getFileName(contentResolver, uri) ?: "unknown"
         val contentType = contentResolver.getType(uri) ?: "application/octet-stream"
@@ -1772,8 +1994,9 @@ private fun handleFileUpload(
                 viewModel.uploadFile(fileName, data, contentType)
             }
         }
+        null
     } catch (e: Exception) {
-        Toast.makeText(context, "Failed to read file: ${e.message}", Toast.LENGTH_SHORT).show()
+        "Failed to read file: ${e.message}"
     }
 }
 
@@ -1804,27 +2027,33 @@ private fun getFileName(
     return name
 }
 
+/**
+ * Save [data] to the public Downloads directory as [fileName].
+ * Returns a user-facing message (success or failure).
+ */
 private fun saveFile(
-    context: Context,
     fileName: String,
     data: ByteArray,
-) {
+): String =
     try {
         val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         val file = File(downloadsDir, fileName)
         FileOutputStream(file).use { it.write(data) }
-        Toast.makeText(context, "Saved to Downloads: $fileName", Toast.LENGTH_SHORT).show()
+        "Saved to Downloads: $fileName"
     } catch (e: Exception) {
-        Toast.makeText(context, "Failed to save: ${e.message}", Toast.LENGTH_SHORT).show()
+        "Failed to save: ${e.message}"
     }
-}
 
+/**
+ * Open [file] with an external app via ACTION_VIEW chooser.
+ * Returns null on success or a failure message.
+ */
 private fun openFileWithExternalApp(
     context: Context,
     file: File,
     mimeType: String,
-) {
-    try {
+): String? {
+    return try {
         val uri =
             FileProvider.getUriForFile(
                 context,
@@ -1844,14 +2073,15 @@ private fun openFileWithExternalApp(
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
         context.startActivity(chooser)
+        null
     } catch (e: Exception) {
-        Toast.makeText(context, "Failed to open file: ${e.message}", Toast.LENGTH_SHORT).show()
+        "Failed to open file: ${e.message}"
     }
 }
 
 @Composable
 private fun TransfersSheetContent(
-    activeTransfers: List<com.imaviso.stash.ui.viewmodel.TransferInfo>,
+    activeTransfers: List<TransferInfo>,
     onCancelTransfer: (String) -> Unit,
     onCancelAll: () -> Unit,
 ) {
@@ -1924,7 +2154,7 @@ private fun TransfersSheetContent(
 
 @Composable
 private fun TransferItemCard(
-    transfer: com.imaviso.stash.ui.viewmodel.TransferInfo,
+    transfer: TransferInfo,
     onCancel: () -> Unit,
 ) {
     Card(
@@ -1986,7 +2216,7 @@ private fun TransferItemCard(
                 if (transfer.error == null) {
                     IconButton(
                         onClick = onCancel,
-                        modifier = Modifier.size(32.dp),
+                        modifier = Modifier.size(48.dp),
                     ) {
                         Icon(
                             Icons.Default.Close,
@@ -2062,6 +2292,7 @@ private fun ShareLinkDialog(
     isGenerating: Boolean,
     onGenerateUrl: (ShareExpiration) -> Unit,
     onDismiss: () -> Unit,
+    onShowMessage: (String) -> Unit,
 ) {
     val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
@@ -2139,7 +2370,7 @@ private fun ShareLinkDialog(
                                 OutlinedButton(
                                     onClick = {
                                         clipboardManager.setText(AnnotatedString(shareUrl))
-                                        Toast.makeText(context, "Link copied!", Toast.LENGTH_SHORT).show()
+                                        onShowMessage("Link copied!")
                                     },
                                     modifier = Modifier.weight(1f),
                                 ) {

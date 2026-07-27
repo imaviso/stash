@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.imaviso.stash.data.model.S3Account
 import com.imaviso.stash.data.model.S3Bucket
 import com.imaviso.stash.data.model.S3Config
+import com.imaviso.stash.data.model.S3Object
 import com.imaviso.stash.data.remote.S3Service
 import com.imaviso.stash.data.repository.ConfigRepository
 import com.imaviso.stash.util.ErrorUtils
@@ -15,6 +16,34 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+
+enum class BucketSortOption(
+    val displayName: String,
+) {
+    NAME_ASC("Name (A-Z)"),
+    NAME_DESC("Name (Z-A)"),
+    DATE_DESC("Newest first"),
+    DATE_ASC("Oldest first"),
+}
+
+/**
+ * Lightweight stats for a single bucket. Fetched on demand via a recursive
+ * listObjects call, so the buckets screen doesn't issue N calls on load.
+ */
+data class BucketStats(
+    val fileCount: Int,
+    val totalSize: Long,
+    val folderCount: Int,
+) {
+    val formattedSize: String
+        get() =
+            when {
+                totalSize < 1024 -> "$totalSize B"
+                totalSize < 1024 * 1024 -> "%.1f KB".format(totalSize / 1024f)
+                totalSize < 1024 * 1024 * 1024 -> "%.1f MB".format(totalSize / (1024f * 1024f))
+                else -> "%.2f GB".format(totalSize / (1024f * 1024f * 1024f))
+            }
+}
 
 data class BucketsUiState(
     val buckets: List<S3Bucket> = emptyList(),
@@ -32,6 +61,13 @@ data class BucketsUiState(
     val activeAccount: S3Account? = null,
     val accounts: List<S3Account> = emptyList(),
     val showAccountPicker: Boolean = false,
+    // Bucket sort
+    val sortOption: BucketSortOption = BucketSortOption.NAME_ASC,
+    // Bucket stats dialog (opt-in)
+    val showStatsDialog: Boolean = false,
+    val statsBucket: S3Bucket? = null,
+    val bucketStats: BucketStats? = null,
+    val isLoadingStats: Boolean = false,
 )
 
 class BucketsViewModel(
@@ -266,6 +302,75 @@ class BucketsViewModel(
                         _uiState.value.copy(
                             isDeleting = false,
                             error = ErrorUtils.formatError(e),
+                        )
+                }
+        }
+    }
+
+    // ==================== BUCKET SORTING ====================
+
+    fun setSortOption(option: BucketSortOption) {
+        _uiState.value = _uiState.value.copy(sortOption = option)
+    }
+
+    /**
+     * Sort the current bucket list by the active sort option. Folders are not
+     * special-cased at the bucket level.
+     */
+    fun sortBuckets(buckets: List<S3Bucket>): List<S3Bucket> =
+        when (_uiState.value.sortOption) {
+            BucketSortOption.NAME_ASC -> buckets.sortedBy { it.name.lowercase() }
+            BucketSortOption.NAME_DESC -> buckets.sortedByDescending { it.name.lowercase() }
+            BucketSortOption.DATE_DESC -> buckets.sortedByDescending { it.creationDate }
+            BucketSortOption.DATE_ASC -> buckets.sortedBy { it.creationDate }
+        }
+
+    // ==================== BUCKET STATS ====================
+
+    fun showBucketStats(bucket: S3Bucket) {
+        _uiState.value =
+            _uiState.value.copy(
+                showStatsDialog = true,
+                statsBucket = bucket,
+                bucketStats = null,
+                isLoadingStats = true,
+            )
+        loadBucketStats(bucket)
+    }
+
+    fun hideBucketStats() {
+        _uiState.value =
+            _uiState.value.copy(
+                showStatsDialog = false,
+                statsBucket = null,
+                bucketStats = null,
+                isLoadingStats = false,
+            )
+    }
+
+    private fun loadBucketStats(bucket: S3Bucket) {
+        viewModelScope.launch {
+            s3Service
+                .listObjectsRecursive(bucket.name, prefix = "")
+                .onSuccess { objects ->
+                    val files = objects.filter { !it.key.endsWith("/") }
+                    val folders = objects.filter { it.key.endsWith("/") }
+                    val stats =
+                        BucketStats(
+                            fileCount = files.size,
+                            totalSize = files.sumOf { it.size },
+                            folderCount = folders.size,
+                        )
+                    _uiState.value =
+                        _uiState.value.copy(
+                            bucketStats = stats,
+                            isLoadingStats = false,
+                        )
+                }.onFailure { e ->
+                    _uiState.value =
+                        _uiState.value.copy(
+                            isLoadingStats = false,
+                            error = "Failed to load stats: ${e.message}",
                         )
                 }
         }

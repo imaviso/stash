@@ -13,19 +13,38 @@ import com.imaviso.stash.data.model.S3Config
 import com.imaviso.stash.data.model.S3Object
 import com.imaviso.stash.data.remote.S3Service
 import com.imaviso.stash.data.repository.ConfigRepository
+import com.imaviso.stash.data.repository.TransferInfo
+import com.imaviso.stash.data.repository.TransferRepository
+import com.imaviso.stash.data.repository.TransferState
+import com.imaviso.stash.data.repository.TransferType
 import com.imaviso.stash.util.ErrorUtils
 import com.imaviso.stash.util.NetworkUtils
 import com.imaviso.stash.worker.DownloadWorker
 import com.imaviso.stash.worker.UploadWorker
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.hours
+
+/**
+ * One-shot snackbar event with an optional action (e.g. Undo). Emitted via
+ * [ObjectsViewModel.snackbarEvents] and collected by the screen so transient
+ * prompts don't live in [ObjectsUiState].
+ */
+data class SnackbarEvent(
+    val message: String,
+    val actionLabel: String? = null,
+    val onAction: (() -> Unit)? = null,
+)
 
 enum class ClipboardAction {
     COPY,
@@ -53,25 +72,6 @@ enum class ViewMode {
     LIST,
     GRID,
 }
-
-/**
- * Represents a file transfer (upload or download) in progress
- */
-enum class TransferType {
-    UPLOAD,
-    DOWNLOAD,
-}
-
-data class TransferInfo(
-    val id: String,
-    val fileName: String,
-    val type: TransferType,
-    val progress: Int = 0,
-    val bytesTransferred: Long = 0,
-    val totalBytes: Long = 0,
-    val status: String = "",
-    val error: String? = null,
-)
 
 /**
  * Share URL expiration options
@@ -161,6 +161,9 @@ data class ObjectsUiState(
     // Search/filter
     val searchQuery: String = "",
     val isSearchActive: Boolean = false,
+    val isSearchRecursive: Boolean = false,
+    val recursiveResults: List<S3Object> = emptyList(),
+    val isSearchingRecursive: Boolean = false,
     // Folder creation
     val showCreateFolderDialog: Boolean = false,
     val isCreatingFolder: Boolean = false,
@@ -191,6 +194,8 @@ data class ObjectsUiState(
     val showStorageStats: Boolean = false,
     val storageStats: StorageStats? = null,
     val isLoadingStats: Boolean = false,
+    // Undo-able single-file delete
+    val pendingDeleteObject: S3Object? = null,
 )
 
 class ObjectsViewModel(
@@ -203,8 +208,15 @@ class ObjectsViewModel(
     private val _uiState = MutableStateFlow(ObjectsUiState())
     val uiState: StateFlow<ObjectsUiState> = _uiState.asStateFlow()
 
+    private val _snackbarEvents = MutableSharedFlow<SnackbarEvent>(extraBufferCapacity = 5)
+    val snackbarEvents: SharedFlow<SnackbarEvent> = _snackbarEvents.asSharedFlow()
+
     // Current running job for cancellation
     private var currentJob: Job? = null
+
+    // Pending undo-able single-file delete: holds the deletion coroutine so
+    // [undoDelete] can cancel it before it commits to S3.
+    private var pendingDeleteJob: Job? = null
 
     init {
         // Observe network connectivity
@@ -330,7 +342,12 @@ class ObjectsViewModel(
                     _uiState.value.copy(
                         objects = objects,
                         isLoading = false,
+                        recursiveResults = emptyList(),
                     )
+                // Re-run recursive search if active so results match new listing.
+                if (_uiState.value.isSearchRecursive && _uiState.value.searchQuery.isNotBlank()) {
+                    maybeRunRecursiveSearch()
+                }
             }.onFailure { e ->
                 _uiState.value =
                     _uiState.value.copy(
@@ -415,8 +432,9 @@ class ObjectsViewModel(
     }
 
     fun selectAll() {
-        val allFiles = _uiState.value.objects.filter { !it.isFolder }
-        _uiState.value = _uiState.value.copy(selectedObjects = allFiles.toSet())
+        // Include folders so bulk operations (delete, details) can target them.
+        val all = _uiState.value.objects
+        _uiState.value = _uiState.value.copy(selectedObjects = all.toSet())
     }
 
     fun clearSelection() {
@@ -431,35 +449,70 @@ class ObjectsViewModel(
         val selected = _uiState.value.selectedObjects.toList()
         if (selected.isEmpty()) return
 
+        val folders = selected.filter { it.isFolder }
+        val files = selected.filter { !it.isFolder }
+
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isDeleting = true)
 
-            s3Service
-                .deleteObjects(_uiState.value.bucketName, selected.map { it.key })
-                .onSuccess {
-                    _uiState.value =
-                        _uiState.value.copy(
-                            isDeleting = false,
-                            showDeleteDialog = false,
-                            isMultiSelectMode = false,
-                            selectedObjects = emptySet(),
-                        )
-                    loadObjects()
-                }.onFailure { e ->
-                    _uiState.value =
-                        _uiState.value.copy(
-                            isDeleting = false,
-                            error = ErrorUtils.formatError(e),
-                        )
+            var failure: String? = null
+
+            // Batch-delete selected files first.
+            if (files.isNotEmpty()) {
+                s3Service
+                    .deleteObjects(_uiState.value.bucketName, files.map { it.key })
+                    .onFailure { e -> failure = ErrorUtils.formatError(e) }
+            }
+
+            // Recursively delete selected folders.
+            for (folder in folders) {
+                val result = recursiveDeleteFolder(folder.key)
+                if (result.isFailure) {
+                    failure = "Failed to delete folder ${folder.fileName}: ${result.exceptionOrNull()?.message}"
                 }
+            }
+
+            _uiState.value =
+                _uiState.value.copy(
+                    isDeleting = false,
+                    showDeleteDialog = false,
+                    isMultiSelectMode = false,
+                    selectedObjects = emptySet(),
+                    error = failure,
+                )
+            loadObjects()
         }
     }
+
+    /**
+     * Recursively delete all objects under [folderKey] plus the folder marker.
+     * Returns failure if any batch delete fails.
+     */
+    private suspend fun recursiveDeleteFolder(folderKey: String): Result<Unit> =
+        runCatching {
+            val objects = s3Service.listObjectsRecursive(_uiState.value.bucketName, folderKey).getOrThrow()
+            if (objects.isNotEmpty()) {
+                objects.chunked(1000).forEach { batch ->
+                    s3Service.deleteObjects(_uiState.value.bucketName, batch.map { it.key }).getOrThrow()
+                }
+            }
+            // Delete the folder marker itself.
+            s3Service.deleteObject(_uiState.value.bucketName, folderKey)
+        }
 
     // ==================== COPY / MOVE ====================
 
     fun copySelectedObjects() {
         val selected = _uiState.value.selectedObjects.toList()
         if (selected.isEmpty()) return
+
+        if (selected.any { it.isFolder }) {
+            _uiState.value =
+                _uiState.value.copy(
+                    error = "Folder copy isn't supported yet. Select files only.",
+                )
+            return
+        }
 
         _uiState.value =
             _uiState.value.copy(
@@ -477,6 +530,14 @@ class ObjectsViewModel(
     fun cutSelectedObjects() {
         val selected = _uiState.value.selectedObjects.toList()
         if (selected.isEmpty()) return
+
+        if (selected.any { it.isFolder }) {
+            _uiState.value =
+                _uiState.value.copy(
+                    error = "Folder move isn't supported yet. Select files only.",
+                )
+            return
+        }
 
         _uiState.value =
             _uiState.value.copy(
@@ -686,36 +747,71 @@ class ObjectsViewModel(
     }
 
     fun deleteObject() {
-        // If in multi-select mode, delete all selected
+        // If in multi-select mode, delete all selected (no undo - bulk op)
         if (_uiState.value.isMultiSelectMode && _uiState.value.selectedObjects.isNotEmpty()) {
             deleteSelectedObjects()
             return
         }
 
-        // Otherwise delete single object
+        // Single object delete - support undo via delayed commit
         val obj = _uiState.value.selectedObject ?: return
 
-        viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isDeleting = true)
-
-            s3Service
-                .deleteObject(_uiState.value.bucketName, obj.key)
-                .onSuccess {
-                    _uiState.value =
-                        _uiState.value.copy(
-                            isDeleting = false,
-                            showDeleteDialog = false,
-                            selectedObject = null,
-                        )
-                    loadObjects()
-                }.onFailure { e ->
-                    _uiState.value =
-                        _uiState.value.copy(
-                            isDeleting = false,
-                            error = ErrorUtils.formatError(e),
-                        )
-                }
+        // Folder deletes are not undo-able (recursive); commit immediately via
+        // the existing recursive path.
+        if (obj.isFolder) {
+            deleteFolderRecursively(obj)
+            return
         }
+
+        // Cancel any previous pending delete so a new one can start.
+        pendingDeleteJob?.cancel()
+        _uiState.value =
+            _uiState.value.copy(
+                showDeleteDialog = false,
+                selectedObject = null,
+                pendingDeleteObject = obj,
+            )
+
+        pendingDeleteJob =
+            viewModelScope.launch {
+                _snackbarEvents.emit(SnackbarEvent("Deleted ${obj.fileName}", "Undo", onAction = ::undoDelete))
+                delay(UNDO_DELETE_WINDOW_MS)
+                s3Service
+                    .deleteObject(_uiState.value.bucketName, obj.key)
+                    .onSuccess {
+                        _uiState.value =
+                            _uiState.value.copy(
+                                pendingDeleteObject = null,
+                            )
+                        loadObjects()
+                    }.onFailure { e ->
+                        _uiState.value =
+                            _uiState.value.copy(
+                                pendingDeleteObject = null,
+                                error = ErrorUtils.formatError(e),
+                            )
+                    }
+            }
+    }
+
+    /**
+     * Cancel a pending single-file delete triggered by an Undo snackbar action.
+     */
+    fun undoDelete() {
+        pendingDeleteJob?.cancel()
+        pendingDeleteJob = null
+        if (_uiState.value.pendingDeleteObject != null) {
+            _uiState.value =
+                _uiState.value.copy(
+                    pendingDeleteObject = null,
+                )
+            viewModelScope.launch { _snackbarEvents.emit(SnackbarEvent("Delete cancelled")) }
+        }
+    }
+
+    companion object {
+        private const val UNDO_DELETE_WINDOW_MS = 5_000L
+        private const val RECURSIVE_SEARCH_DEBOUNCE_MS = 400L
     }
 
     // ==================== UPLOAD / DOWNLOAD ====================
@@ -895,7 +991,9 @@ class ObjectsViewModel(
     private val workManager = WorkManager.getInstance(application)
 
     /**
-     * Helper to add or update a transfer in the active transfers list
+     * Helper to add or update a transfer in the active transfers list and
+     * mirror it to the app-wide [TransferRepository] so the Transfers screen
+     * can observe progress regardless of which bucket screen started it.
      */
     private fun updateTransfer(transfer: TransferInfo) {
         val currentTransfers = _uiState.value.activeTransfers.toMutableList()
@@ -906,10 +1004,42 @@ class ObjectsViewModel(
             currentTransfers.add(transfer)
         }
         _uiState.value = _uiState.value.copy(activeTransfers = currentTransfers)
+        TransferRepository.upsert(
+            transfer.copy(
+                state = TransferState.ACTIVE,
+                bucketName = _uiState.value.bucketName,
+            ),
+        )
     }
 
     /**
-     * Helper to remove a transfer from the active transfers list
+     * Record a terminal state in the repository and drop the transfer from the
+     * local active list. Terminal records remain in history until cleared.
+     */
+    private fun recordTerminal(
+        transferId: String,
+        state: TransferState,
+        fileName: String,
+        type: TransferType,
+        error: String? = null,
+        totalBytes: Long = 0,
+        bytesTransferred: Long = 0,
+    ) {
+        TransferRepository.markTerminal(
+            id = transferId,
+            state = state,
+            fileName = fileName,
+            type = type,
+            bucketName = _uiState.value.bucketName,
+            error = error,
+            totalBytes = totalBytes,
+            bytesTransferred = bytesTransferred,
+        )
+        removeTransfer(transferId)
+    }
+
+    /**
+     * Helper to remove a transfer from the active transfers list (local only).
      */
     private fun removeTransfer(transferId: String) {
         val currentTransfers = _uiState.value.activeTransfers.filter { it.id != transferId }
@@ -993,31 +1123,34 @@ class ObjectsViewModel(
                     }
 
                     WorkInfo.State.SUCCEEDED -> {
-                        removeTransfer(transferId)
+                        recordTerminal(
+                            transferId = transferId,
+                            state = TransferState.COMPLETED,
+                            fileName = fileName,
+                            type = TransferType.UPLOAD,
+                            totalBytes = workInfo.outputData.getLong(UploadWorker.KEY_BYTES_UPLOADED, 0L),
+                        )
                         loadObjects()
                     }
 
                     WorkInfo.State.FAILED -> {
                         val error = workInfo.outputData.getString(UploadWorker.KEY_ERROR) ?: "Upload failed"
-                        updateTransfer(
-                            TransferInfo(
-                                id = transferId,
-                                fileName = fileName,
-                                type = TransferType.UPLOAD,
-                                progress = 0,
-                                status = "Failed",
-                                error = error,
-                            ),
+                        recordTerminal(
+                            transferId = transferId,
+                            state = TransferState.FAILED,
+                            fileName = fileName,
+                            type = TransferType.UPLOAD,
+                            error = error,
                         )
-                        // Remove after a delay so user can see the error
-                        viewModelScope.launch {
-                            kotlinx.coroutines.delay(3000)
-                            removeTransfer(transferId)
-                        }
                     }
 
                     WorkInfo.State.CANCELLED -> {
-                        removeTransfer(transferId)
+                        recordTerminal(
+                            transferId = transferId,
+                            state = TransferState.CANCELLED,
+                            fileName = fileName,
+                            type = TransferType.UPLOAD,
+                        )
                     }
 
                     else -> { /* ENQUEUED, BLOCKED - no action needed */ }
@@ -1102,30 +1235,34 @@ class ObjectsViewModel(
                     }
 
                     WorkInfo.State.SUCCEEDED -> {
-                        removeTransfer(transferId)
+                        recordTerminal(
+                            transferId = transferId,
+                            state = TransferState.COMPLETED,
+                            fileName = obj.fileName,
+                            type = TransferType.DOWNLOAD,
+                            totalBytes = obj.size,
+                            bytesTransferred = obj.size,
+                        )
                     }
 
                     WorkInfo.State.FAILED -> {
                         val error = workInfo.outputData.getString(DownloadWorker.KEY_ERROR) ?: "Download failed"
-                        updateTransfer(
-                            TransferInfo(
-                                id = transferId,
-                                fileName = obj.fileName,
-                                type = TransferType.DOWNLOAD,
-                                progress = 0,
-                                status = "Failed",
-                                error = error,
-                            ),
+                        recordTerminal(
+                            transferId = transferId,
+                            state = TransferState.FAILED,
+                            fileName = obj.fileName,
+                            type = TransferType.DOWNLOAD,
+                            error = error,
                         )
-                        // Remove after a delay so user can see the error
-                        viewModelScope.launch {
-                            kotlinx.coroutines.delay(3000)
-                            removeTransfer(transferId)
-                        }
                     }
 
                     WorkInfo.State.CANCELLED -> {
-                        removeTransfer(transferId)
+                        recordTerminal(
+                            transferId = transferId,
+                            state = TransferState.CANCELLED,
+                            fileName = obj.fileName,
+                            type = TransferType.DOWNLOAD,
+                        )
                     }
 
                     else -> { /* ENQUEUED, BLOCKED - no action needed */ }
@@ -1139,7 +1276,19 @@ class ObjectsViewModel(
      */
     fun cancelTransfer(transferId: String) {
         workManager.cancelAllWorkByTag("transfer_$transferId")
+        val active = _uiState.value.activeTransfers.firstOrNull { it.id == transferId }
         removeTransfer(transferId)
+        if (active != null) {
+            TransferRepository.markTerminal(
+                id = transferId,
+                state = TransferState.CANCELLED,
+                fileName = active.fileName,
+                type = active.type,
+                bucketName = _uiState.value.bucketName,
+            )
+        } else {
+            TransferRepository.removeActive(transferId)
+        }
     }
 
     /**
@@ -1148,6 +1297,7 @@ class ObjectsViewModel(
     fun cancelBackgroundTransfers() {
         workManager.cancelAllWorkByTag("upload")
         workManager.cancelAllWorkByTag("download")
+        val active = _uiState.value.activeTransfers
         _uiState.value =
             _uiState.value.copy(
                 activeTransfers = emptyList(),
@@ -1158,12 +1308,25 @@ class ObjectsViewModel(
                 uploadProgressPercent = 0f,
                 downloadProgressPercent = 0f,
             )
+        active.forEach {
+            TransferRepository.markTerminal(
+                id = it.id,
+                state = TransferState.CANCELLED,
+                fileName = it.fileName,
+                type = it.type,
+                bucketName = _uiState.value.bucketName,
+            )
+        }
     }
 
     // ==================== SEARCH / FILTER ====================
 
+    // Debounce job for recursive search; cancelled on new query / navigation.
+    private var recursiveSearchJob: Job? = null
+
     fun setSearchQuery(query: String) {
         _uiState.value = _uiState.value.copy(searchQuery = query)
+        maybeRunRecursiveSearch()
     }
 
     fun toggleSearch() {
@@ -1172,15 +1335,78 @@ class ObjectsViewModel(
             _uiState.value.copy(
                 isSearchActive = isActive,
                 searchQuery = if (!isActive) "" else _uiState.value.searchQuery,
+                recursiveResults = emptyList(),
             )
+        if (isActive && _uiState.value.isSearchRecursive) {
+            maybeRunRecursiveSearch()
+        }
     }
 
     fun clearSearch() {
+        recursiveSearchJob?.cancel()
         _uiState.value =
             _uiState.value.copy(
                 searchQuery = "",
                 isSearchActive = false,
+                isSearchRecursive = false,
+                recursiveResults = emptyList(),
+                isSearchingRecursive = false,
             )
+    }
+
+    fun toggleSearchRecursive() {
+        val nowOn = !_uiState.value.isSearchRecursive
+        _uiState.value =
+            _uiState.value.copy(
+                isSearchRecursive = nowOn,
+                recursiveResults = emptyList(),
+            )
+        if (nowOn) {
+            maybeRunRecursiveSearch()
+        } else {
+            recursiveSearchJob?.cancel()
+            _uiState.value = _uiState.value.copy(isSearchingRecursive = false)
+        }
+    }
+
+    /**
+     * Run a recursive search if a query is present and recursive mode is on.
+     * Debounced so typing doesn't fire a listObjectsRecursive per keystroke.
+     */
+    private fun maybeRunRecursiveSearch() {
+        val query = _uiState.value.searchQuery.trim()
+        recursiveSearchJob?.cancel()
+        if (!_uiState.value.isSearchRecursive || query.isBlank()) {
+            _uiState.value = _uiState.value.copy(recursiveResults = emptyList(), isSearchingRecursive = false)
+            return
+        }
+        val bucket = _uiState.value.bucketName
+        val prefix = _uiState.value.currentPrefix
+        recursiveSearchJob =
+            viewModelScope.launch {
+                _uiState.value = _uiState.value.copy(isSearchingRecursive = true)
+                kotlinx.coroutines.delay(RECURSIVE_SEARCH_DEBOUNCE_MS)
+                s3Service
+                    .listObjectsRecursive(bucket, prefix)
+                    .onSuccess { objects ->
+                        val matched =
+                            objects.filter {
+                                it.fileName.contains(query, ignoreCase = true) ||
+                                    it.key.contains(query, ignoreCase = true)
+                            }
+                        _uiState.value =
+                            _uiState.value.copy(
+                                recursiveResults = sortObjects(matched),
+                                isSearchingRecursive = false,
+                            )
+                    }.onFailure { e ->
+                        _uiState.value =
+                            _uiState.value.copy(
+                                isSearchingRecursive = false,
+                                error = "Search failed: ${e.message}",
+                            )
+                    }
+            }
     }
 
     // ==================== FOLDER CREATION ====================
@@ -1624,7 +1850,12 @@ class ObjectsViewModel(
                                 folderDownloadProgress = "",
                                 error = "Folder is empty",
                             )
-                        removeTransfer(transferId)
+                        recordTerminal(
+                            transferId = transferId,
+                            state = TransferState.CANCELLED,
+                            fileName = folderName,
+                            type = TransferType.DOWNLOAD,
+                        )
                         return@onSuccess
                     }
 
@@ -1685,7 +1916,15 @@ class ObjectsViewModel(
                             isDownloadingFolder = false,
                             folderDownloadProgress = "",
                         )
-                    removeTransfer(transferId)
+                    recordTerminal(
+                        transferId = transferId,
+                        state = if (downloadedFiles == totalFiles) TransferState.COMPLETED else TransferState.FAILED,
+                        fileName = folderName,
+                        type = TransferType.DOWNLOAD,
+                        totalBytes = totalSize,
+                        bytesTransferred = downloadedBytes,
+                        error = if (downloadedFiles == totalFiles) null else "Only $downloadedFiles of $totalFiles files downloaded",
+                    )
 
                     // Show success message
                     if (downloadedFiles == totalFiles) {
@@ -1706,7 +1945,13 @@ class ObjectsViewModel(
                             folderDownloadProgress = "",
                             error = "Failed to scan folder: ${e.message}",
                         )
-                    removeTransfer(transferId)
+                    recordTerminal(
+                        transferId = transferId,
+                        state = TransferState.FAILED,
+                        fileName = folderName,
+                        type = TransferType.DOWNLOAD,
+                        error = e.message,
+                    )
                 }
         }
     }

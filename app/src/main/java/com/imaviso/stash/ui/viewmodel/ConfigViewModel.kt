@@ -26,6 +26,7 @@ data class ConfigUiState(
     val isSuccess: Boolean = false,
     val showDeleteDialog: Boolean = false,
     val accountToDelete: S3Account? = null,
+    val appLockEnabled: Boolean = false,
 )
 
 class ConfigViewModel(
@@ -56,6 +57,17 @@ class ConfigViewModel(
             repository.activeAccountIdFlow.collect { activeId ->
                 _uiState.value = _uiState.value.copy(activeAccountId = activeId)
             }
+        }
+        viewModelScope.launch {
+            repository.appLockEnabledFlow.collect { enabled ->
+                _uiState.value = _uiState.value.copy(appLockEnabled = enabled)
+            }
+        }
+    }
+
+    fun setAppLockEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            repository.setAppLockEnabled(enabled)
         }
     }
 
