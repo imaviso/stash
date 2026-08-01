@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -21,11 +23,24 @@ android {
     }
 
     signingConfigs {
+        // Credentials read from gitignored keystore.properties (project root),
+        // falling back to environment variables. Never hardcode passwords here.
+        val keystorePropertiesFile = rootProject.file("keystore.properties")
+        val keystoreProperties =
+            Properties().apply {
+                if (keystorePropertiesFile.exists()) {
+                    keystorePropertiesFile.inputStream().use { load(it) }
+                }
+            }
         create("release") {
             storeFile = file("../stash-release.keystore")
-            storePassword = "stashapp"
-            keyAlias = "stash"
-            keyPassword = "stashapp"
+            storePassword =
+                keystoreProperties.getProperty("storePassword")
+                    ?: System.getenv("STASH_KEYSTORE_PASSWORD")
+            keyAlias = keystoreProperties.getProperty("keyAlias") ?: "stash"
+            keyPassword =
+                keystoreProperties.getProperty("keyPassword")
+                    ?: System.getenv("STASH_KEY_PASSWORD")
         }
     }
 
@@ -121,6 +136,8 @@ dependencies {
 
     // Testing
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
+    testImplementation("app.cash.turbine:turbine:1.0.0")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
     androidTestImplementation(platform("androidx.compose:compose-bom:2024.02.00"))

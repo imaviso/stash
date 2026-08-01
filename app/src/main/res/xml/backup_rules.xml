@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <full-backup-content>
     <include domain="sharedpref" path="."/>
+    <include domain="file" path="datastore/"/>
     <exclude domain="sharedpref" path="device.xml"/>
+    <!-- EncryptedSharedPreferences: credentials must never be backed up -->
+    <exclude domain="sharedpref" path="secure_credentials.xml"/>
+    <!-- DataStore holds legacy plaintext creds (pre-migration) + account state -->
+    <exclude domain="file" path="datastore/s3_config.preferences_pb"/>
 </full-backup-content>

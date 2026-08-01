@@ -14,6 +14,15 @@ import kotlinx.coroutines.flow.distinctUntilChanged
  * Utility class for network connectivity checks
  */
 object NetworkUtils {
+    const val NO_CONNECTION_ERROR = "No internet connection. Please check your network and try again."
+
+    /**
+     * Return [NO_CONNECTION_ERROR] when offline, null when network is available.
+     * Shared by ViewModels' checkNetwork guards.
+     */
+    fun offlineErrorIfUnavailable(context: Context): String? =
+        if (!isNetworkAvailable(context)) NO_CONNECTION_ERROR else null
+
     /**
      * Check if the device currently has network connectivity
      */
@@ -69,13 +78,4 @@ object NetworkUtils {
                 connectivityManager.unregisterNetworkCallback(callback)
             }
         }.distinctUntilChanged()
-}
-
-/**
- * Sealed class representing network connectivity state
- */
-sealed class NetworkState {
-    object Available : NetworkState()
-
-    object Unavailable : NetworkState()
 }

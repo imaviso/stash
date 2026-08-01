@@ -34,3 +34,4 @@ app/release/
 # Keystore (keep safe, don't commit)
 *.jks
 *.keystore
+keystore.properties

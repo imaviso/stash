@@ -12,11 +12,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.imaviso.stash.data.repository.TransferInfo
-import com.imaviso.stash.data.repository.TransferState
-import com.imaviso.stash.data.repository.TransferType
+import com.imaviso.stash.data.transfer.TransferInfo
+import com.imaviso.stash.data.transfer.TransferState
+import com.imaviso.stash.data.transfer.TransferType
 import com.imaviso.stash.ui.viewmodel.TransfersViewModel
+import com.imaviso.stash.util.FormatUtils
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -27,8 +29,8 @@ fun TransfersScreen(
     onNavigateBack: () -> Unit,
     viewModel: TransfersViewModel = viewModel(),
 ) {
-    val activeTransfers by viewModel.activeTransfers.collectAsState()
-    val historyTransfers by viewModel.historyTransfers.collectAsState()
+    val activeTransfers by viewModel.activeTransfers.collectAsStateWithLifecycle()
+    val historyTransfers by viewModel.historyTransfers.collectAsStateWithLifecycle()
 
     Scaffold(
         topBar = {
@@ -238,8 +240,8 @@ private fun TransferItem(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
-                        Text(
-                            text = formatBytes(transfer.bytesTransferred),
+                                Text(
+                                    text = FormatUtils.formatBytes(transfer.bytesTransferred),
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -248,8 +250,8 @@ private fun TransferItem(
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        Text(
-                            text = formatBytes(transfer.totalBytes),
+                                Text(
+                                    text = FormatUtils.formatBytes(transfer.totalBytes),
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -268,11 +270,3 @@ private fun TransferItem(
         }
     }
 }
-
-private fun formatBytes(bytes: Long): String =
-    when {
-        bytes < 1024 -> "$bytes B"
-        bytes < 1024 * 1024 -> "%.1f KB".format(bytes / 1024f)
-        bytes < 1024 * 1024 * 1024 -> "%.1f MB".format(bytes / (1024f * 1024f))
-        else -> "%.1f GB".format(bytes / (1024f * 1024f * 1024f))
-    }

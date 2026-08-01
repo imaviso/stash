@@ -5,13 +5,14 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Parcelable
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
+import androidx.fragment.app.FragmentActivity
+import com.imaviso.stash.ui.AppLockGate
 import com.imaviso.stash.ui.screens.ShareUploadScreen
 import com.imaviso.stash.ui.theme.ComposeAppTheme
 
@@ -19,7 +20,7 @@ import com.imaviso.stash.ui.theme.ComposeAppTheme
  * Activity that receives share intents from other apps.
  * Allows users to upload shared files to S3.
  */
-class ShareReceiverActivity : ComponentActivity() {
+class ShareReceiverActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -33,16 +34,19 @@ class ShareReceiverActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background,
                 ) {
-                    ShareUploadScreen(
-                        sharedUris = sharedUris,
-                        onUploadComplete = {
-                            // Close this activity after upload
-                            finish()
-                        },
-                        onCancel = {
-                            finish()
-                        },
-                    )
+                    // Same app-lock gate as MainActivity - no lock bypass via share
+                    AppLockGate {
+                        ShareUploadScreen(
+                            sharedUris = sharedUris,
+                            onUploadComplete = {
+                                // Close this activity after upload
+                                finish()
+                            },
+                            onCancel = {
+                                finish()
+                            },
+                        )
+                    }
                 }
             }
         }

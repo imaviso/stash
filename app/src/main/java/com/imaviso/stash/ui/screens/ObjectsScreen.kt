@@ -6,7 +6,6 @@ import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import android.os.Environment
 import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
@@ -41,6 +40,7 @@ import androidx.compose.material.pullrefresh.pullRefresh
 import androidx.compose.material.pullrefresh.rememberPullRefreshState
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -55,27 +55,33 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.core.content.FileProvider
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.imaviso.stash.data.model.FileType
+import com.imaviso.stash.data.model.FileTypeStats
+import com.imaviso.stash.ui.preview.PreviewSource
 import com.imaviso.stash.data.model.S3Object
+import com.imaviso.stash.data.model.StorageStats
 import com.imaviso.stash.ui.viewmodel.ClipboardAction
-import com.imaviso.stash.ui.viewmodel.FileTypeStats
 import com.imaviso.stash.ui.viewmodel.ObjectsViewModel
 import com.imaviso.stash.ui.viewmodel.ShareExpiration
 import com.imaviso.stash.ui.viewmodel.SortOption
-import com.imaviso.stash.ui.viewmodel.StorageStats
-import com.imaviso.stash.data.repository.TransferInfo
-import com.imaviso.stash.data.repository.TransferType
+import com.imaviso.stash.data.transfer.TransferInfo
+import com.imaviso.stash.data.transfer.TransferType
+import com.imaviso.stash.ui.components.BreadcrumbNavigation
+import com.imaviso.stash.ui.components.CreateFolderDialog
+import com.imaviso.stash.ui.components.ObjectActionsMenu
+import com.imaviso.stash.ui.components.openFileWithExternalApp
 import com.imaviso.stash.ui.viewmodel.ViewMode
+import com.imaviso.stash.util.DownloadsSaver
+import com.imaviso.stash.util.FormatUtils
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.launch
 import java.io.File
-import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -86,7 +92,7 @@ fun ObjectsScreen(
     onNavigateBack: () -> Unit,
     viewModel: ObjectsViewModel = viewModel(),
 ) {
-    val uiState by viewModel.uiState.collectAsState()
+    val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
     val screenScope = rememberCoroutineScope()
@@ -233,30 +239,52 @@ fun ObjectsScreen(
         viewModel.navigateUp()
     }
 
-    // Show preview screen as overlay when previewObject is set
-    if (uiState.previewObject != null) {
+    // Show preview screen as overlay while a preview session is active. The
+    // PreviewController owns policy + source resolution; here we only map the
+    // resolved PreviewSource onto the screen's render params.
+    val previewController by viewModel.previewController.collectAsStateWithLifecycle()
+    if (previewController != null) {
+        val previewState by previewController!!.state.collectAsStateWithLifecycle()
+        val currentPreviewObject = previewState.currentObject ?: return
+
         // Handle back gesture to close preview
         BackHandler {
             viewModel.closePreview()
         }
 
+        var previewFileData: ByteArray? = null
+        var previewStreamUrl: String? = null
+        var isPreviewLoading = false
+        var previewError: String? = null
+        when (val source = previewState.source) {
+            is PreviewSource.Stream -> previewStreamUrl = source.url
+            is PreviewSource.Bytes -> previewFileData = source.data
+            is PreviewSource.TooLarge ->
+                previewError =
+                    "File too large for preview (${currentPreviewObject.formattedSize}). Download instead."
+
+            is PreviewSource.Unsupported -> { }
+            is PreviewSource.Loading -> isPreviewLoading = true
+            is PreviewSource.Error -> previewError = source.message
+        }
+
         FilePreviewScreen(
-            previewableObjects = uiState.previewableObjects,
-            currentIndex = uiState.previewIndex,
-            currentObject = uiState.previewObject!!,
-            fileData = uiState.previewData,
-            streamUrl = uiState.previewStreamUrl,
-            isLoading = uiState.isPreviewLoading,
-            error = uiState.previewError,
+            previewableObjects = previewState.objects,
+            currentIndex = previewState.index,
+            currentObject = currentPreviewObject,
+            fileData = previewFileData,
+            streamUrl = previewStreamUrl,
+            isLoading = isPreviewLoading,
+            error = previewError,
             onNavigateBack = { viewModel.closePreview() },
             onPageChanged = { newIndex -> viewModel.navigateToPreviewIndex(newIndex) },
             onDownload = { obj ->
                 // For streaming media or large files, use background download
-                if (uiState.previewStreamUrl != null || obj.size > 5 * 1024 * 1024) {
+                if (previewStreamUrl != null || obj.size > 5 * 1024 * 1024) {
                     viewModel.downloadFileInBackground(obj)
                 } else {
-                    uiState.previewData?.let { data ->
-                        showMessage(saveFile(obj.fileName, data))
+                    previewFileData?.let { data ->
+                        showMessage(saveFile(context, obj.fileName, obj.mimeType, data))
                     }
                 }
             },
@@ -575,7 +603,7 @@ fun ObjectsScreen(
                 if (uiState.pathHistory.size > 1 || uiState.currentPrefix.isNotEmpty()) {
                     BreadcrumbNavigation(
                         pathHistory = uiState.pathHistory,
-                        bucketName = bucketName,
+                        rootLabel = bucketName,
                         onNavigateToSegment = { viewModel.navigateToPathSegment(it) },
                     )
                     HorizontalDivider()
@@ -622,7 +650,7 @@ fun ObjectsScreen(
                                 ),
                             verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            items(displayObjects) { obj ->
+                            items(displayObjects, key = { it.key }) { obj ->
                                 // Load thumbnail URL for images and videos
                                 var thumbnailUrl by remember(obj.key) { mutableStateOf<String?>(null) }
                                 LaunchedEffect(obj.key) {
@@ -663,8 +691,8 @@ fun ObjectsScreen(
                                         if (obj.size > 5 * 1024 * 1024) {
                                             viewModel.downloadFileInBackground(obj)
                                         } else {
-                                            viewModel.downloadObject(obj) { data ->
-                                                showMessage(saveFile(obj.fileName, data))
+                                            viewModel.downloadObject(obj) { message ->
+                                                showMessage(message)
                                             }
                                         }
                                     },
@@ -702,7 +730,7 @@ fun ObjectsScreen(
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            items(displayObjects) { obj ->
+                            items(displayObjects, key = { it.key }) { obj ->
                                 var thumbnailUrl by remember(obj.key) { mutableStateOf<String?>(null) }
                                 LaunchedEffect(obj.key) {
                                     if ((obj.fileType == FileType.IMAGE || obj.fileType == FileType.VIDEO) && !obj.isFolder) {
@@ -740,8 +768,8 @@ fun ObjectsScreen(
                                         if (obj.size > 5 * 1024 * 1024) {
                                             viewModel.downloadFileInBackground(obj)
                                         } else {
-                                            viewModel.downloadObject(obj) { data ->
-                                                showMessage(saveFile(obj.fileName, data))
+                                            viewModel.downloadObject(obj) { message ->
+                                                showMessage(message)
                                             }
                                         }
                                     },
@@ -1168,119 +1196,18 @@ private fun ObjectItem(
                             tint = secondaryContentColor,
                         )
                     }
-                    DropdownMenu(
+                    ObjectActionsMenu(
                         expanded = showMenu,
-                        onDismissRequest = { showMenu = false },
-                    ) {
-                        if (obj.isFolder) {
-                            // Folder-specific actions
-                            if (onDownloadFolder != null) {
-                                DropdownMenuItem(
-                                    text = { Text("Download folder") },
-                                    onClick = {
-                                        showMenu = false
-                                        onDownloadFolder()
-                                    },
-                                    leadingIcon = {
-                                        Icon(Icons.Default.FolderZip, contentDescription = null)
-                                    },
-                                )
-                            }
-                            DropdownMenuItem(
-                                text = { Text("Details") },
-                                onClick = {
-                                    showMenu = false
-                                    onDetails()
-                                },
-                                leadingIcon = {
-                                    Icon(Icons.Default.Info, contentDescription = null)
-                                },
-                            )
-                            HorizontalDivider()
-                            DropdownMenuItem(
-                                text = { Text("Delete folder") },
-                                onClick = {
-                                    showMenu = false
-                                    onDelete()
-                                },
-                                leadingIcon = {
-                                    Icon(
-                                        Icons.Default.DeleteForever,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.error,
-                                    )
-                                },
-                            )
-                        } else {
-                            // File-specific actions
-                            DropdownMenuItem(
-                                text = { Text("Share link") },
-                                onClick = {
-                                    showMenu = false
-                                    onShare()
-                                },
-                                leadingIcon = {
-                                    Icon(Icons.Default.Share, contentDescription = null)
-                                },
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Open with") },
-                                onClick = {
-                                    showMenu = false
-                                    onOpenWith()
-                                },
-                                leadingIcon = {
-                                    Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null)
-                                },
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Download") },
-                                onClick = {
-                                    showMenu = false
-                                    onDownload()
-                                },
-                                leadingIcon = {
-                                    Icon(Icons.Default.Download, contentDescription = null)
-                                },
-                            )
-                            HorizontalDivider()
-                            DropdownMenuItem(
-                                text = { Text("Rename") },
-                                onClick = {
-                                    showMenu = false
-                                    onRename()
-                                },
-                                leadingIcon = {
-                                    Icon(Icons.Default.Edit, contentDescription = null)
-                                },
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Details") },
-                                onClick = {
-                                    showMenu = false
-                                    onDetails()
-                                },
-                                leadingIcon = {
-                                    Icon(Icons.Default.Info, contentDescription = null)
-                                },
-                            )
-                            HorizontalDivider()
-                            DropdownMenuItem(
-                                text = { Text("Delete") },
-                                onClick = {
-                                    showMenu = false
-                                    onDelete()
-                                },
-                                leadingIcon = {
-                                    Icon(
-                                        Icons.Default.Delete,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.error,
-                                    )
-                                },
-                            )
-                        }
-                    }
+                        onDismiss = { showMenu = false },
+                        isFolder = obj.isFolder,
+                        onDownload = onDownload,
+                        onOpenWith = onOpenWith,
+                        onShare = onShare,
+                        onRename = onRename,
+                        onDetails = onDetails,
+                        onDelete = onDelete,
+                        onDownloadFolder = onDownloadFolder,
+                    )
                 }
             }
         }
@@ -1458,57 +1385,13 @@ private fun DeleteMultipleObjectsDialog(
 }
 
 @Composable
-private fun CreateFolderDialog(
-    onConfirm: (String) -> Unit,
-    onDismiss: () -> Unit,
-    isCreating: Boolean,
-) {
-    var folderName by remember { mutableStateOf("") }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Create Folder") },
-        text = {
-            OutlinedTextField(
-                value = folderName,
-                onValueChange = { folderName = it },
-                label = { Text("Folder name") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-        },
-        confirmButton = {
-            Button(
-                onClick = { onConfirm(folderName) },
-                enabled = !isCreating && folderName.isNotBlank(),
-            ) {
-                if (isCreating) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(16.dp),
-                        strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.onPrimary,
-                    )
-                } else {
-                    Text("Create")
-                }
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Cancel")
-            }
-        },
-    )
-}
-
-@Composable
 private fun RenameDialog(
     currentName: String,
     onConfirm: (String) -> Unit,
     onDismiss: () -> Unit,
     isRenaming: Boolean,
 ) {
-    var newName by remember { mutableStateOf(currentName) }
+    var newName by rememberSaveable { mutableStateOf(currentName) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1573,74 +1456,6 @@ private fun NoSearchResultsView(query: String) {
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-    }
-}
-
-@Composable
-private fun BreadcrumbNavigation(
-    pathHistory: List<String>,
-    bucketName: String,
-    onNavigateToSegment: (Int) -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val scrollState = rememberScrollState()
-
-    Row(
-        modifier =
-            modifier
-                .fillMaxWidth()
-                .horizontalScroll(scrollState)
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        // Root/bucket
-        TextButton(
-            onClick = { onNavigateToSegment(0) },
-            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-        ) {
-            Icon(
-                Icons.Default.Home,
-                contentDescription = null,
-                modifier = Modifier.size(16.dp),
-            )
-            Spacer(modifier = Modifier.width(4.dp))
-            Text(bucketName, style = MaterialTheme.typography.bodyMedium)
-        }
-
-        // Path segments
-        pathHistory.drop(1).forEachIndexed { index, path ->
-            Icon(
-                Icons.Default.ChevronRight,
-                contentDescription = null,
-                modifier = Modifier.size(16.dp),
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-
-            val segmentName = path.trimEnd('/').substringAfterLast('/')
-            val isLast = index == pathHistory.size - 2
-
-            TextButton(
-                onClick = { onNavigateToSegment(index + 1) },
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-            ) {
-                Text(
-                    text = segmentName,
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = if (isLast) androidx.compose.ui.text.font.FontWeight.Bold else null,
-                    color =
-                        if (isLast) {
-                            MaterialTheme.colorScheme.primary
-                        } else {
-                            MaterialTheme.colorScheme.onSurface
-                        },
-                )
-            }
-        }
-    }
-
-    // Auto-scroll to end when path changes
-    LaunchedEffect(pathHistory) {
-        scrollState.animateScrollTo(scrollState.maxValue)
     }
 }
 
@@ -1868,103 +1683,18 @@ private fun ObjectGridItem(
                             modifier = Modifier.size(20.dp),
                         )
                     }
-                    DropdownMenu(
+                    ObjectActionsMenu(
                         expanded = showMenu,
-                        onDismissRequest = { showMenu = false },
-                    ) {
-                        if (obj.isFolder) {
-                            if (onDownloadFolder != null) {
-                                DropdownMenuItem(
-                                    text = { Text("Download folder") },
-                                    onClick = {
-                                        showMenu = false
-                                        onDownloadFolder()
-                                    },
-                                    leadingIcon = { Icon(Icons.Default.FolderZip, contentDescription = null) },
-                                )
-                            }
-                            DropdownMenuItem(
-                                text = { Text("Details") },
-                                onClick = {
-                                    showMenu = false
-                                    onDetails()
-                                },
-                                leadingIcon = { Icon(Icons.Default.Info, contentDescription = null) },
-                            )
-                            HorizontalDivider()
-                            DropdownMenuItem(
-                                text = { Text("Delete folder") },
-                                onClick = {
-                                    showMenu = false
-                                    onDelete()
-                                },
-                                leadingIcon = {
-                                    Icon(
-                                        Icons.Default.DeleteForever,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.error,
-                                    )
-                                },
-                            )
-                        } else {
-                            DropdownMenuItem(
-                                text = { Text("Share link") },
-                                onClick = {
-                                    showMenu = false
-                                    onShare()
-                                },
-                                leadingIcon = { Icon(Icons.Default.Share, contentDescription = null) },
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Open with") },
-                                onClick = {
-                                    showMenu = false
-                                    onOpenWith()
-                                },
-                                leadingIcon = { Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null) },
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Download") },
-                                onClick = {
-                                    showMenu = false
-                                    onDownload()
-                                },
-                                leadingIcon = { Icon(Icons.Default.Download, contentDescription = null) },
-                            )
-                            HorizontalDivider()
-                            DropdownMenuItem(
-                                text = { Text("Rename") },
-                                onClick = {
-                                    showMenu = false
-                                    onRename()
-                                },
-                                leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null) },
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Details") },
-                                onClick = {
-                                    showMenu = false
-                                    onDetails()
-                                },
-                                leadingIcon = { Icon(Icons.Default.Info, contentDescription = null) },
-                            )
-                            HorizontalDivider()
-                            DropdownMenuItem(
-                                text = { Text("Delete") },
-                                onClick = {
-                                    showMenu = false
-                                    onDelete()
-                                },
-                                leadingIcon = {
-                                    Icon(
-                                        Icons.Default.Delete,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.error,
-                                    )
-                                },
-                            )
-                        }
-                    }
+                        onDismiss = { showMenu = false },
+                        isFolder = obj.isFolder,
+                        onDownload = onDownload,
+                        onOpenWith = onOpenWith,
+                        onShare = onShare,
+                        onRename = onRename,
+                        onDetails = onDetails,
+                        onDelete = onDelete,
+                        onDownloadFolder = onDownloadFolder,
+                    )
                 }
             }
         }
@@ -1982,18 +1712,8 @@ private fun handleFileUpload(
         val contentType = contentResolver.getType(uri) ?: "application/octet-stream"
         val fileSize = getFileSize(contentResolver, uri)
 
-        // Use background upload for all files via WorkManager
-        // This allows uploads to continue even when app is backgrounded
-        if (fileSize > 5 * 1024 * 1024) {
-            // Large files - use WorkManager background upload
-            viewModel.uploadFileInBackground(uri, fileName, contentType)
-        } else {
-            // For small files, read into memory (faster)
-            contentResolver.openInputStream(uri)?.use { inputStream ->
-                val data = inputStream.readBytes()
-                viewModel.uploadFile(fileName, data, contentType)
-            }
-        }
+        // Foreground vs background dispatch (>5MB) is owned by the transfer module
+        viewModel.uploadFile(uri, fileName, fileSize, contentType)
         null
     } catch (e: Exception) {
         "Failed to read file: ${e.message}"
@@ -2018,66 +1738,32 @@ private fun getFileName(
     contentResolver: ContentResolver,
     uri: Uri,
 ): String? {
-    var name: String? = null
     contentResolver.query(uri, null, null, null, null)?.use { cursor ->
         val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-        cursor.moveToFirst()
-        name = cursor.getString(nameIndex)
+        // Guard against missing DISPLAY_NAME column (some providers omit it)
+        if (nameIndex >= 0 && cursor.moveToFirst()) {
+            cursor.getString(nameIndex)?.let { return it }
+        }
     }
-    return name
+    return uri.lastPathSegment ?: "unknown"
 }
 
 /**
- * Save [data] to the public Downloads directory as [fileName].
- * Returns a user-facing message (success or failure).
+ * Save [data] to the public Downloads directory as [fileName] (MediaStore on
+ * API 29+, legacy path below). Returns a user-facing message (success or failure).
  */
 private fun saveFile(
+    context: Context,
     fileName: String,
+    mimeType: String,
     data: ByteArray,
 ): String =
     try {
-        val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        val file = File(downloadsDir, fileName)
-        FileOutputStream(file).use { it.write(data) }
+        DownloadsSaver.saveBytesToDownloads(context, fileName, mimeType, data)
         "Saved to Downloads: $fileName"
     } catch (e: Exception) {
         "Failed to save: ${e.message}"
     }
-
-/**
- * Open [file] with an external app via ACTION_VIEW chooser.
- * Returns null on success or a failure message.
- */
-private fun openFileWithExternalApp(
-    context: Context,
-    file: File,
-    mimeType: String,
-): String? {
-    return try {
-        val uri =
-            FileProvider.getUriForFile(
-                context,
-                "${context.packageName}.fileprovider",
-                file,
-            )
-
-        val intent =
-            Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, mimeType)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-
-        val chooser =
-            Intent.createChooser(intent, "Open with").apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-        context.startActivity(chooser)
-        null
-    } catch (e: Exception) {
-        "Failed to open file: ${e.message}"
-    }
-}
 
 @Composable
 private fun TransfersSheetContent(
@@ -2275,13 +1961,7 @@ private fun TransferItemCard(
     }
 }
 
-private fun formatTransferBytes(bytes: Long): String =
-    when {
-        bytes < 1024 -> "$bytes B"
-        bytes < 1024 * 1024 -> "%.1f KB".format(bytes / 1024f)
-        bytes < 1024 * 1024 * 1024 -> "%.1f MB".format(bytes / (1024f * 1024f))
-        else -> "%.1f GB".format(bytes / (1024f * 1024f * 1024f))
-    }
+private fun formatTransferBytes(bytes: Long): String = FormatUtils.formatBytes(bytes)
 
 // ==================== SHARE DIALOG ====================
 
@@ -2543,12 +2223,12 @@ private fun FileTypeStatRow(
         }
     val color =
         when (fileType) {
-            FileType.IMAGE -> Color(0xFF4CAF50)
-            FileType.VIDEO -> Color(0xFFF44336)
-            FileType.AUDIO -> Color(0xFF9C27B0)
-            FileType.TEXT -> Color(0xFF2196F3)
-            FileType.PDF -> Color(0xFFFF5722)
-            FileType.OTHER -> Color(0xFF607D8B)
+            FileType.IMAGE -> MaterialTheme.colorScheme.tertiary
+            FileType.VIDEO -> MaterialTheme.colorScheme.error
+            FileType.AUDIO -> MaterialTheme.colorScheme.secondary
+            FileType.TEXT -> MaterialTheme.colorScheme.primary
+            FileType.PDF -> MaterialTheme.colorScheme.error
+            FileType.OTHER -> MaterialTheme.colorScheme.onSurfaceVariant
         }
 
     Row(

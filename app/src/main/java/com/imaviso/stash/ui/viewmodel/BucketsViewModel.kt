@@ -4,17 +4,23 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.imaviso.stash.data.model.S3Account
+import kotlinx.coroutines.CancellationException
 import com.imaviso.stash.data.model.S3Bucket
 import com.imaviso.stash.data.model.S3Config
 import com.imaviso.stash.data.model.S3Object
 import com.imaviso.stash.data.remote.S3Service
 import com.imaviso.stash.data.repository.ConfigRepository
+import com.imaviso.stash.data.transfer.TransferManager
 import com.imaviso.stash.util.ErrorUtils
+import com.imaviso.stash.util.FormatUtils
 import com.imaviso.stash.util.NetworkUtils
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 enum class BucketSortOption(
@@ -36,13 +42,7 @@ data class BucketStats(
     val folderCount: Int,
 ) {
     val formattedSize: String
-        get() =
-            when {
-                totalSize < 1024 -> "$totalSize B"
-                totalSize < 1024 * 1024 -> "%.1f KB".format(totalSize / 1024f)
-                totalSize < 1024 * 1024 * 1024 -> "%.1f MB".format(totalSize / (1024f * 1024f))
-                else -> "%.2f GB".format(totalSize / (1024f * 1024f * 1024f))
-            }
+        get() = FormatUtils.formatBytes(totalSize)
 }
 
 data class BucketsUiState(
@@ -74,11 +74,18 @@ class BucketsViewModel(
     application: Application,
 ) : AndroidViewModel(application) {
     private val context = application.applicationContext
-    private val configRepository = ConfigRepository(application)
-    private val s3Service = S3Service()
+    private val configRepository = ConfigRepository.getInstance(application)
+    private val s3Service = S3Service.getInstance()
 
     private val _uiState = MutableStateFlow(BucketsUiState())
     val uiState: StateFlow<BucketsUiState> = _uiState.asStateFlow()
+
+    /** Number of currently active transfers, for the transfers entry-point badge. */
+    val activeTransferCount: StateFlow<Int> =
+        TransferManager
+            .getInstance(application)
+            .activeTransferCount
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
 
     init {
         loadAccounts()
@@ -90,7 +97,7 @@ class BucketsViewModel(
         viewModelScope.launch {
             NetworkUtils.observeNetworkConnectivity(context).collect { isConnected ->
                 val wasOffline = _uiState.value.isOffline
-                _uiState.value = _uiState.value.copy(isOffline = !isConnected)
+                _uiState.update { it.copy(isOffline = !isConnected) }
                 // Auto-refresh when coming back online
                 if (isConnected && wasOffline && _uiState.value.isConfigured) {
                     refresh()
@@ -100,27 +107,26 @@ class BucketsViewModel(
     }
 
     private fun checkNetwork(): Boolean {
-        if (!NetworkUtils.isNetworkAvailable(context)) {
-            _uiState.value =
-                _uiState.value.copy(
-                    isOffline = true,
-                    error = "No internet connection. Please check your network and try again.",
-                )
-            return false
+        val offlineError = NetworkUtils.offlineErrorIfUnavailable(context) ?: return true
+        _uiState.update {
+            it.copy(
+                isOffline = true,
+                error = offlineError,
+            )
         }
-        return true
+        return false
     }
 
     private fun loadAccounts() {
         viewModelScope.launch {
             configRepository.accountsFlow.collect { accounts ->
-                _uiState.value = _uiState.value.copy(accounts = accounts)
+                _uiState.update { it.copy(accounts = accounts) }
             }
         }
         viewModelScope.launch {
             configRepository.activeAccountFlow.collect { account ->
                 val previousAccount = _uiState.value.activeAccount
-                _uiState.value = _uiState.value.copy(activeAccount = account)
+                _uiState.update { it.copy(activeAccount = account) }
 
                 // Reload buckets if account changed
                 if (previousAccount?.id != account?.id && account != null) {
@@ -134,46 +140,43 @@ class BucketsViewModel(
         viewModelScope.launch {
             val config = configRepository.configFlow.first()
             if (config.isValid()) {
-                _uiState.value = _uiState.value.copy(isConfigured = true)
+                _uiState.update { it.copy(isConfigured = true) }
                 initializeAndLoadBuckets(config)
             } else {
-                _uiState.value =
-                    _uiState.value.copy(
+                _uiState.update { it.copy(
                         isConfigured = false,
                         error = null, // Don't show error, just show "not configured" view
-                    )
+                    ) }
             }
         }
     }
 
     private suspend fun initializeAndLoadBuckets(config: S3Config) {
         if (!NetworkUtils.isNetworkAvailable(context)) {
-            _uiState.value =
-                _uiState.value.copy(
-                    isLoading = false,
-                    isOffline = true,
-                    error = "No internet connection. Please check your network and try again.",
-                )
+            _uiState.update { it.copy(
+                isLoading = false,
+                isOffline = true,
+                error = NetworkUtils.NO_CONNECTION_ERROR,
+            ) }
             return
         }
 
-        _uiState.value =
-            _uiState.value.copy(
-                isLoading = true,
-                error = null,
-                isConfigured = true,
-                isOffline = false,
-            )
+        _uiState.update { it.copy(
+            isLoading = true,
+            error = null,
+            isConfigured = true,
+            isOffline = false,
+        ) }
 
         try {
             s3Service.initialize(config)
             loadBuckets()
         } catch (e: Exception) {
-            _uiState.value =
-                _uiState.value.copy(
-                    isLoading = false,
-                    error = ErrorUtils.formatError(e),
-                )
+            if (e is CancellationException) throw e
+            _uiState.update { it.copy(
+                isLoading = false,
+                error = ErrorUtils.formatError(e),
+            ) }
         }
     }
 
@@ -188,54 +191,52 @@ class BucketsViewModel(
     }
 
     private suspend fun loadBuckets() {
-        _uiState.value = _uiState.value.copy(isLoading = true, error = null, isOffline = false)
+        _uiState.update { it.copy(isLoading = true, error = null, isOffline = false) }
 
         s3Service
             .listBuckets()
             .onSuccess { buckets ->
-                _uiState.value =
-                    _uiState.value.copy(
+                _uiState.update { it.copy(
                         buckets = buckets,
                         isLoading = false,
-                    )
+                    ) }
             }.onFailure { e ->
-                _uiState.value =
-                    _uiState.value.copy(
+                _uiState.update { it.copy(
                         isLoading = false,
                         error = ErrorUtils.formatError(e),
-                    )
+                    ) }
             }
     }
 
     // ==================== ACCOUNT SWITCHING ====================
 
     fun showAccountPicker() {
-        _uiState.value = _uiState.value.copy(showAccountPicker = true)
+        _uiState.update { it.copy(showAccountPicker = true) }
     }
 
     fun hideAccountPicker() {
-        _uiState.value = _uiState.value.copy(showAccountPicker = false)
+        _uiState.update { it.copy(showAccountPicker = false) }
     }
 
     fun switchAccount(account: S3Account) {
         viewModelScope.launch {
             configRepository.setActiveAccount(account.id)
-            _uiState.value = _uiState.value.copy(showAccountPicker = false)
+            _uiState.update { it.copy(showAccountPicker = false) }
         }
     }
 
     // ==================== BUCKET OPERATIONS ====================
 
     fun showCreateDialog() {
-        _uiState.value = _uiState.value.copy(showCreateDialog = true, newBucketName = "")
+        _uiState.update { it.copy(showCreateDialog = true, newBucketName = "") }
     }
 
     fun hideCreateDialog() {
-        _uiState.value = _uiState.value.copy(showCreateDialog = false, newBucketName = "")
+        _uiState.update { it.copy(showCreateDialog = false, newBucketName = "") }
     }
 
     fun updateNewBucketName(name: String) {
-        _uiState.value = _uiState.value.copy(newBucketName = name)
+        _uiState.update { it.copy(newBucketName = name) }
     }
 
     fun createBucket() {
@@ -243,66 +244,60 @@ class BucketsViewModel(
         if (name.isBlank()) return
 
         viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isCreating = true)
+            _uiState.update { it.copy(isCreating = true) }
 
             s3Service
                 .createBucket(name)
                 .onSuccess {
-                    _uiState.value =
-                        _uiState.value.copy(
+                    _uiState.update { it.copy(
                             isCreating = false,
                             showCreateDialog = false,
                             newBucketName = "",
-                        )
+                        ) }
                     loadBuckets()
                 }.onFailure { e ->
-                    _uiState.value =
-                        _uiState.value.copy(
+                    _uiState.update { it.copy(
                             isCreating = false,
                             error = ErrorUtils.formatError(e),
-                        )
+                        ) }
                 }
         }
     }
 
     fun showDeleteDialog(bucket: S3Bucket) {
-        _uiState.value =
-            _uiState.value.copy(
+        _uiState.update { it.copy(
                 showDeleteDialog = true,
                 selectedBucket = bucket,
-            )
+            ) }
     }
 
     fun hideDeleteDialog() {
-        _uiState.value =
-            _uiState.value.copy(
+        _uiState.update { it.copy(
                 showDeleteDialog = false,
                 selectedBucket = null,
-            )
+            ) }
     }
 
     fun deleteBucket() {
         val bucket = _uiState.value.selectedBucket ?: return
 
         viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isDeleting = true)
+            _uiState.update { it.copy(isDeleting = true) }
 
             s3Service
                 .deleteBucket(bucket.name)
                 .onSuccess {
-                    _uiState.value =
-                        _uiState.value.copy(
+                    _uiState.update { it.copy(
                             isDeleting = false,
                             showDeleteDialog = false,
                             selectedBucket = null,
-                        )
+                        ) }
                     loadBuckets()
                 }.onFailure { e ->
-                    _uiState.value =
-                        _uiState.value.copy(
+                    _uiState.update { it.copy(
                             isDeleting = false,
                             error = ErrorUtils.formatError(e),
-                        )
+                        ) }
                 }
         }
     }
@@ -310,7 +305,7 @@ class BucketsViewModel(
     // ==================== BUCKET SORTING ====================
 
     fun setSortOption(option: BucketSortOption) {
-        _uiState.value = _uiState.value.copy(sortOption = option)
+        _uiState.update { it.copy(sortOption = option) }
     }
 
     /**
@@ -328,24 +323,22 @@ class BucketsViewModel(
     // ==================== BUCKET STATS ====================
 
     fun showBucketStats(bucket: S3Bucket) {
-        _uiState.value =
-            _uiState.value.copy(
+        _uiState.update { it.copy(
                 showStatsDialog = true,
                 statsBucket = bucket,
                 bucketStats = null,
                 isLoadingStats = true,
-            )
+            ) }
         loadBucketStats(bucket)
     }
 
     fun hideBucketStats() {
-        _uiState.value =
-            _uiState.value.copy(
+        _uiState.update { it.copy(
                 showStatsDialog = false,
                 statsBucket = null,
                 bucketStats = null,
                 isLoadingStats = false,
-            )
+            ) }
     }
 
     private fun loadBucketStats(bucket: S3Bucket) {
@@ -361,27 +354,25 @@ class BucketsViewModel(
                             totalSize = files.sumOf { it.size },
                             folderCount = folders.size,
                         )
-                    _uiState.value =
-                        _uiState.value.copy(
+                    _uiState.update { it.copy(
                             bucketStats = stats,
                             isLoadingStats = false,
-                        )
+                        ) }
                 }.onFailure { e ->
-                    _uiState.value =
-                        _uiState.value.copy(
+                    _uiState.update { it.copy(
                             isLoadingStats = false,
                             error = "Failed to load stats: ${e.message}",
-                        )
+                        ) }
                 }
         }
     }
 
     fun clearError() {
-        _uiState.value = _uiState.value.copy(error = null)
+        _uiState.update { it.copy(error = null) }
     }
 
     override fun onCleared() {
         super.onCleared()
-        s3Service.close()
+        // S3Service is a process-wide singleton - do not close the shared client here
     }
 }

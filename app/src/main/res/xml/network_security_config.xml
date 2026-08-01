@@ -1,4 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Cleartext HTTP is intentionally allowed globally: the app talks to arbitrary
+     user-configured/self-hosted S3-compatible endpoints (Garage, MinIO, Ceph, ...)
+     which are commonly served over plain HTTP on LANs. Endpoints using HTTPS are
+     unaffected. Users are expected to configure TLS endpoints when traversing
+     untrusted networks. -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="true">
         <trust-anchors>

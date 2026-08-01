@@ -100,7 +100,7 @@ object ErrorUtils {
                 "Invalid bucket name. Use only lowercase letters, numbers, and hyphens."
             }
 
-            lowerMessage.contains("keytolong") ||
+            lowerMessage.contains("keytoolong") ||
                 lowerMessage.contains("key too long") -> {
                 "The file path is too long."
             }

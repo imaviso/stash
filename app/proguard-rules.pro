@@ -39,3 +39,9 @@
 
 # Coil
 -dontwarn coil.**
+
+# Strip debug/verbose logging in release builds
+-assumenosideeffects class android.util.Log {
+    public *** d(...);
+    public *** v(...);
+}

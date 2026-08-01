@@ -2,6 +2,11 @@
 <data-extraction-rules>
     <cloud-backup>
         <include domain="sharedpref" path="."/>
+        <include domain="file" path="datastore/"/>
         <exclude domain="sharedpref" path="device.xml"/>
+        <!-- EncryptedSharedPreferences: credentials must never be backed up -->
+        <exclude domain="sharedpref" path="secure_credentials.xml"/>
+        <!-- DataStore holds legacy plaintext creds (pre-migration) + account state -->
+        <exclude domain="file" path="datastore/s3_config.preferences_pb"/>
     </cloud-backup>
 </data-extraction-rules>

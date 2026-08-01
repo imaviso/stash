@@ -2,64 +2,44 @@ package com.imaviso.stash.ui.viewmodel
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
-import androidx.work.WorkManager
-import com.imaviso.stash.data.repository.TransferInfo
-import com.imaviso.stash.data.repository.TransferRepository
-import com.imaviso.stash.data.repository.TransferState
+import com.imaviso.stash.data.transfer.TransferInfo
+import com.imaviso.stash.data.transfer.TransferManager
+import com.imaviso.stash.data.transfer.TransferState
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import androidx.lifecycle.viewModelScope
 
 /**
- * Read-only view model for the Transfers screen. Backed by the app-wide
- * [TransferRepository] so it shows active + history regardless of which
- * bucket screen initiated the transfers.
+ * Read-only view model for the Transfers screen. Backed by the transfer
+ * module (single authority) so it shows active + history regardless of which
+ * screen initiated the transfers; cancellation delegates to the module's
+ * dispatch (background work or in-process job).
  */
 class TransfersViewModel(
     application: Application,
 ) : AndroidViewModel(application) {
-    private val workManager = WorkManager.getInstance(application)
+    private val transferManager = TransferManager.getInstance(application)
 
     val activeTransfers: StateFlow<List<TransferInfo>> =
-        TransferRepository.transfers
-            .map { list -> list.filter { it.state == TransferState.ACTIVE } }
-            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+        transferManager.activeTransfers
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     val historyTransfers: StateFlow<List<TransferInfo>> =
-        TransferRepository.transfers
-            .map { list -> list.filter { it.state != TransferState.ACTIVE }.sortedByDescending { it.timestamp } }
-            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+        transferManager.historyTransfers
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     fun cancelTransfer(transferId: String) {
-        workManager.cancelAllWorkByTag("transfer_$transferId")
-        val active = TransferRepository.transfers.value.firstOrNull { it.id == transferId } ?: return
-        TransferRepository.markTerminal(
-            id = transferId,
-            state = TransferState.CANCELLED,
-            fileName = active.fileName,
-            type = active.type,
-            bucketName = active.bucketName,
-        )
+        transferManager.cancel(transferId)
     }
 
     fun cancelAll() {
-        TransferRepository.transfers.value
+        transferManager.records.value.values
             .filter { it.state == TransferState.ACTIVE }
-            .forEach {
-                workManager.cancelAllWorkByTag("transfer_${it.id}")
-                TransferRepository.markTerminal(
-                    id = it.id,
-                    state = TransferState.CANCELLED,
-                    fileName = it.fileName,
-                    type = it.type,
-                    bucketName = it.bucketName,
-                )
-            }
+            .forEach { transferManager.cancel(it.id) }
     }
 
     fun clearHistory() {
-        TransferRepository.clearHistory()
+        transferManager.clearHistory()
     }
 }

@@ -1,5 +1,6 @@
 package com.imaviso.stash.data.model
 
+import com.imaviso.stash.util.FormatUtils
 import java.util.Date
 
 data class S3Bucket(
@@ -24,14 +25,10 @@ data class S3Object(
     val storageClass: String? = null,
 ) {
     val fileName: String
-        get() {
-            // For folders (keys ending with /), strip the trailing slash first
-            val normalizedKey = key.trimEnd('/')
-            return normalizedKey.substringAfterLast('/')
-        }
+        get() = ObjectKey(key).fileName
 
     val isFolder: Boolean
-        get() = key.endsWith('/')
+        get() = ObjectKey(key).isFolder
 
     val extension: String
         get() = fileName.substringAfterLast('.', "").lowercase()
@@ -135,26 +132,5 @@ data class S3Object(
         get() = fileType in listOf(FileType.IMAGE, FileType.VIDEO, FileType.AUDIO, FileType.TEXT, FileType.PDF)
 
     val formattedSize: String
-        get() =
-            when {
-                size < 1024 -> "$size B"
-                size < 1024 * 1024 -> "${size / 1024} KB"
-                size < 1024 * 1024 * 1024 -> "${size / (1024 * 1024)} MB"
-                else -> "${size / (1024 * 1024 * 1024)} GB"
-            }
-}
-
-data class S3ObjectUpload(
-    val key: String,
-    val contentType: String,
-    val data: ByteArray,
-) {
-    override fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (javaClass != other?.javaClass) return false
-        other as S3ObjectUpload
-        return key == other.key
-    }
-
-    override fun hashCode(): Int = key.hashCode()
+        get() = FormatUtils.formatBytes(size)
 }

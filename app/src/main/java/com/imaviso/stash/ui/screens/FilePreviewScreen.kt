@@ -1,10 +1,7 @@
 package com.imaviso.stash.ui.screens
 
-import android.content.Context
-import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.pdf.PdfRenderer
-import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.widget.Toast
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -38,7 +35,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.core.content.FileProvider
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
@@ -47,44 +43,12 @@ import coil.compose.AsyncImagePainter
 import coil.request.ImageRequest
 import com.imaviso.stash.data.model.FileType
 import com.imaviso.stash.data.model.S3Object
+import com.imaviso.stash.ui.components.openFileWithExternalApp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
-
-/**
- * Data class to hold preview state for a single file
- */
-data class PreviewState(
-    val fileData: ByteArray? = null,
-    val streamUrl: String? = null,
-    val isLoading: Boolean = true,
-    val error: String? = null,
-) {
-    override fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (javaClass != other?.javaClass) return false
-        other as PreviewState
-        if (fileData != null) {
-            if (other.fileData == null) return false
-            if (!fileData.contentEquals(other.fileData)) return false
-        } else if (other.fileData != null) {
-            return false
-        }
-        if (streamUrl != other.streamUrl) return false
-        if (isLoading != other.isLoading) return false
-        if (error != other.error) return false
-        return true
-    }
-
-    override fun hashCode(): Int {
-        var result = fileData?.contentHashCode() ?: 0
-        result = 31 * result + (streamUrl?.hashCode() ?: 0)
-        result = 31 * result + isLoading.hashCode()
-        result = 31 * result + (error?.hashCode() ?: 0)
-        return result
-    }
-}
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -169,7 +133,9 @@ fun FilePreviewScreen(
                                     if (onOpenWith != null) {
                                         onOpenWith(currentObject, tempFile)
                                     } else {
-                                        openWithExternalApp(context, tempFile, currentObject.mimeType)
+                                        openFileWithExternalApp(context, tempFile, currentObject.mimeType)?.let { message ->
+                                            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+                                        }
                                     }
                                 } catch (e: Exception) {
                                     Toast.makeText(context, "Failed to open: ${e.message}", Toast.LENGTH_SHORT).show()
@@ -441,7 +407,7 @@ private fun PreviewContent(
                 when (s3Object.fileType) {
                     FileType.VIDEO -> VideoStreamPreview(streamUrl)
                     FileType.AUDIO -> AudioStreamPreview(streamUrl, s3Object.fileName)
-                    FileType.IMAGE -> ImageStreamPreview(streamUrl)
+                    FileType.IMAGE -> ZoomableImagePreview(streamUrl)
                     else -> UnsupportedPreview(s3Object)
                 }
             }
@@ -449,7 +415,7 @@ private fun PreviewContent(
             fileData != null -> {
                 when (s3Object.fileType) {
                     FileType.IMAGE -> {
-                        ImagePreview(fileData)
+                        ZoomableImagePreview(fileData)
                     }
 
                     FileType.VIDEO, FileType.AUDIO -> {
@@ -507,8 +473,12 @@ fun FilePreviewScreen(
     )
 }
 
+/**
+ * Zoomable image preview shared by byte-array and streamed (presigned URL)
+ * variants - [model] is passed straight to Coil (ByteArray or URL String).
+ */
 @Composable
-private fun ImagePreview(data: ByteArray) {
+private fun ZoomableImagePreview(model: Any?) {
     var scale by remember { mutableFloatStateOf(1f) }
     var offsetX by remember { mutableFloatStateOf(0f) }
     var offsetY by remember { mutableFloatStateOf(0f) }
@@ -558,81 +528,7 @@ private fun ImagePreview(data: ByteArray) {
             model =
                 ImageRequest
                     .Builder(LocalContext.current)
-                    .data(data)
-                    .crossfade(true)
-                    .build(),
-            contentDescription = "Image preview",
-            modifier =
-                Modifier
-                    .fillMaxSize()
-                    .graphicsLayer(
-                        scaleX = scale,
-                        scaleY = scale,
-                        translationX = offsetX,
-                        translationY = offsetY,
-                    ),
-            contentScale = ContentScale.Fit,
-            onState = { imageState = it },
-        )
-
-        if (imageState is AsyncImagePainter.State.Loading) {
-            CircularProgressIndicator(color = Color.White)
-        }
-    }
-}
-
-@Composable
-private fun ImageStreamPreview(streamUrl: String) {
-    var scale by remember { mutableFloatStateOf(1f) }
-    var offsetX by remember { mutableFloatStateOf(0f) }
-    var offsetY by remember { mutableFloatStateOf(0f) }
-
-    // Reset offset when returning to normal scale
-    LaunchedEffect(scale) {
-        if (scale <= 1f) {
-            offsetX = 0f
-            offsetY = 0f
-        }
-    }
-
-    Box(
-        modifier =
-            Modifier
-                .fillMaxSize()
-                .background(Color.Black)
-                .pointerInput(Unit) {
-                    detectTransformGestures { _, pan, zoom, _ ->
-                        val newScale = (scale * zoom).coerceIn(1f, 5f)
-                        scale = newScale
-                        // Only allow panning when zoomed in
-                        if (scale > 1f) {
-                            offsetX += pan.x
-                            offsetY += pan.y
-                        }
-                    }
-                }.pointerInput(Unit) {
-                    detectTapGestures(
-                        onDoubleTap = {
-                            // Toggle between 1x and 2.5x zoom on double tap
-                            if (scale > 1f) {
-                                scale = 1f
-                                offsetX = 0f
-                                offsetY = 0f
-                            } else {
-                                scale = 2.5f
-                            }
-                        },
-                    )
-                },
-        contentAlignment = Alignment.Center,
-    ) {
-        var imageState by remember { mutableStateOf<AsyncImagePainter.State?>(null) }
-
-        AsyncImage(
-            model =
-                ImageRequest
-                    .Builder(LocalContext.current)
-                    .data(streamUrl)
+                    .data(model)
                     .crossfade(true)
                     .build(),
             contentDescription = "Image preview",
@@ -677,133 +573,17 @@ private fun ImageStreamPreview(streamUrl: String) {
     }
 }
 
+/**
+ * Shared ExoPlayer setup for streaming previews from presigned URLs.
+ * Released automatically when the caller leaves composition.
+ */
 @Composable
-private fun VideoPreview(
-    data: ByteArray,
-    mimeType: String,
-) {
+private fun rememberStreamExoPlayer(
+    streamUrl: String,
+    playWhenReady: Boolean,
+    onError: (String) -> Unit,
+): ExoPlayer {
     val context = LocalContext.current
-
-    // Write to temp file for ExoPlayer
-    val tempFile =
-        remember(data) {
-            File.createTempFile("video_preview", ".tmp", context.cacheDir).apply {
-                writeBytes(data)
-                deleteOnExit()
-            }
-        }
-
-    val exoPlayer =
-        remember {
-            ExoPlayer.Builder(context).build().apply {
-                val mediaItem = MediaItem.fromUri(Uri.fromFile(tempFile))
-                setMediaItem(mediaItem)
-                prepare()
-            }
-        }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            exoPlayer.release()
-            tempFile.delete()
-        }
-    }
-
-    Box(
-        modifier =
-            Modifier
-                .fillMaxSize()
-                .background(Color.Black),
-    ) {
-        AndroidView(
-            factory = { ctx ->
-                PlayerView(ctx).apply {
-                    player = exoPlayer
-                    useController = true
-                }
-            },
-            modifier = Modifier.fillMaxSize(),
-        )
-    }
-}
-
-@Composable
-private fun AudioPreview(
-    data: ByteArray,
-    mimeType: String,
-    fileName: String,
-) {
-    val context = LocalContext.current
-
-    // Write to temp file for ExoPlayer
-    val tempFile =
-        remember(data) {
-            File.createTempFile("audio_preview", ".tmp", context.cacheDir).apply {
-                writeBytes(data)
-                deleteOnExit()
-            }
-        }
-
-    val exoPlayer =
-        remember {
-            ExoPlayer.Builder(context).build().apply {
-                val mediaItem = MediaItem.fromUri(Uri.fromFile(tempFile))
-                setMediaItem(mediaItem)
-                prepare()
-            }
-        }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            exoPlayer.release()
-            tempFile.delete()
-        }
-    }
-
-    Column(
-        modifier =
-            Modifier
-                .fillMaxSize()
-                .padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
-    ) {
-        Icon(
-            Icons.Default.MusicNote,
-            contentDescription = null,
-            modifier = Modifier.size(128.dp),
-            tint = MaterialTheme.colorScheme.primary,
-        )
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        Text(
-            fileName,
-            style = MaterialTheme.typography.titleLarge,
-        )
-
-        Spacer(modifier = Modifier.height(32.dp))
-
-        AndroidView(
-            factory = { ctx ->
-                PlayerView(ctx).apply {
-                    player = exoPlayer
-                    useController = true
-                }
-            },
-            modifier =
-                Modifier
-                    .fillMaxWidth()
-                    .height(80.dp),
-        )
-    }
-}
-
-// Streaming video preview from presigned URL - no memory loading required
-@Composable
-private fun VideoStreamPreview(streamUrl: String) {
-    val context = LocalContext.current
-    var errorMessage by remember { mutableStateOf<String?>(null) }
 
     val exoPlayer =
         remember(streamUrl) {
@@ -813,13 +593,13 @@ private fun VideoStreamPreview(streamUrl: String) {
                 addListener(
                     object : androidx.media3.common.Player.Listener {
                         override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                            android.util.Log.e("VideoPreview", "ExoPlayer error: ${error.message}", error)
-                            errorMessage = "Playback error: ${error.message}"
+                            android.util.Log.e("StreamPreview", "ExoPlayer error: ${error.message}", error)
+                            onError("Playback error: ${error.message}")
                         }
                     },
                 )
                 prepare()
-                playWhenReady = true
+                this.playWhenReady = playWhenReady
             }
         }
 
@@ -828,6 +608,32 @@ private fun VideoStreamPreview(streamUrl: String) {
             exoPlayer.release()
         }
     }
+
+    return exoPlayer
+}
+
+@Composable
+private fun PlaybackErrorCard(error: String) {
+    Card(
+        modifier = Modifier.padding(16.dp),
+        colors =
+            CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.errorContainer,
+            ),
+    ) {
+        Text(
+            text = error,
+            modifier = Modifier.padding(16.dp),
+            color = MaterialTheme.colorScheme.onErrorContainer,
+        )
+    }
+}
+
+// Streaming video preview from presigned URL - no memory loading required
+@Composable
+private fun VideoStreamPreview(streamUrl: String) {
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    val exoPlayer = rememberStreamExoPlayer(streamUrl, playWhenReady = true) { errorMessage = it }
 
     Box(
         modifier =
@@ -848,19 +654,7 @@ private fun VideoStreamPreview(streamUrl: String) {
 
         // Show error if playback fails
         errorMessage?.let { error ->
-            Card(
-                modifier = Modifier.padding(16.dp),
-                colors =
-                    CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.errorContainer,
-                    ),
-            ) {
-                Text(
-                    text = error,
-                    modifier = Modifier.padding(16.dp),
-                    color = MaterialTheme.colorScheme.onErrorContainer,
-                )
-            }
+            PlaybackErrorCard(error)
         }
     }
 }
@@ -871,31 +665,8 @@ private fun AudioStreamPreview(
     streamUrl: String,
     fileName: String,
 ) {
-    val context = LocalContext.current
     var errorMessage by remember { mutableStateOf<String?>(null) }
-
-    val exoPlayer =
-        remember(streamUrl) {
-            ExoPlayer.Builder(context).build().apply {
-                val mediaItem = MediaItem.fromUri(streamUrl)
-                setMediaItem(mediaItem)
-                addListener(
-                    object : androidx.media3.common.Player.Listener {
-                        override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                            android.util.Log.e("AudioPreview", "ExoPlayer error: ${error.message}", error)
-                            errorMessage = "Playback error: ${error.message}"
-                        }
-                    },
-                )
-                prepare()
-            }
-        }
-
-    DisposableEffect(streamUrl) {
-        onDispose {
-            exoPlayer.release()
-        }
-    }
+    val exoPlayer = rememberStreamExoPlayer(streamUrl, playWhenReady = false) { errorMessage = it }
 
     Column(
         modifier =
@@ -907,19 +678,7 @@ private fun AudioStreamPreview(
     ) {
         // Show error if playback fails
         errorMessage?.let { error ->
-            Card(
-                modifier = Modifier.padding(16.dp),
-                colors =
-                    CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.errorContainer,
-                    ),
-            ) {
-                Text(
-                    text = error,
-                    modifier = Modifier.padding(16.dp),
-                    color = MaterialTheme.colorScheme.onErrorContainer,
-                )
-            }
+            PlaybackErrorCard(error)
             Spacer(modifier = Modifier.height(16.dp))
         }
 
@@ -994,15 +753,21 @@ private fun PdfPreview(
     fileName: String,
 ) {
     val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
 
-    // State for rendered PDF pages
-    var pdfPages by remember { mutableStateOf<List<Bitmap>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
     var pageCount by remember { mutableIntStateOf(0) }
+    var maxPages by remember { mutableIntStateOf(0) }
 
-    // Render PDF pages on composition
+    // Renderer kept open for the lifetime of this preview; pages render lazily
+    // per visible item instead of all up front (avoids OOM on large PDFs).
+    var pdfRenderer by remember { mutableStateOf<PdfRenderer?>(null) }
+    var parcelFileDescriptor by remember { mutableStateOf<ParcelFileDescriptor?>(null) }
+    var tempFile by remember { mutableStateOf<File?>(null) }
+    // PdfRenderer is not thread-safe - serialize page rendering.
+    val renderMutex = remember { kotlinx.coroutines.sync.Mutex() }
+
+    // Open the PDF on composition (limit preview to first 50 pages)
     LaunchedEffect(fileData) {
         isLoading = true
         error = null
@@ -1010,55 +775,33 @@ private fun PdfPreview(
         withContext(Dispatchers.IO) {
             try {
                 // Write PDF data to temp file
-                val tempFile = File.createTempFile("pdf_preview", ".pdf", context.cacheDir)
-                tempFile.writeBytes(fileData)
+                val file = File.createTempFile("pdf_preview", ".pdf", context.cacheDir)
+                file.writeBytes(fileData)
 
                 // Open PDF with PdfRenderer
-                val parcelFileDescriptor =
-                    ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
-                val pdfRenderer = PdfRenderer(parcelFileDescriptor)
+                val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+                val renderer = PdfRenderer(pfd)
 
-                pageCount = pdfRenderer.pageCount
-                val renderedPages = mutableListOf<Bitmap>()
-
-                // Render each page (limit to first 50 pages for performance)
-                val maxPages = minOf(pdfRenderer.pageCount, 50)
-                for (i in 0 until maxPages) {
-                    val page = pdfRenderer.openPage(i)
-
-                    // Calculate bitmap size (2x for better quality on high-DPI screens)
-                    val scale = 2f
-                    val width = (page.width * scale).toInt()
-                    val height = (page.height * scale).toInt()
-
-                    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                    // Fill with white background
-                    bitmap.eraseColor(android.graphics.Color.WHITE)
-
-                    page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                    page.close()
-
-                    renderedPages.add(bitmap)
-                }
-
-                pdfRenderer.close()
-                parcelFileDescriptor.close()
-                tempFile.delete()
-
-                pdfPages = renderedPages
+                pageCount = renderer.pageCount
+                maxPages = minOf(renderer.pageCount, 50)
+                tempFile = file
+                parcelFileDescriptor = pfd
+                pdfRenderer = renderer
                 isLoading = false
             } catch (e: Exception) {
-                android.util.Log.e("PdfPreview", "Failed to render PDF", e)
+                android.util.Log.e("PdfPreview", "Failed to open PDF", e)
                 error = "Failed to render PDF: ${e.message}"
                 isLoading = false
             }
         }
     }
 
-    // Clean up bitmaps when leaving composition
+    // Clean up renderer when leaving composition
     DisposableEffect(Unit) {
         onDispose {
-            pdfPages.forEach { it.recycle() }
+            pdfRenderer?.close()
+            parcelFileDescriptor?.close()
+            tempFile?.delete()
         }
     }
 
@@ -1108,7 +851,7 @@ private fun PdfPreview(
                 }
             }
 
-            pdfPages.isNotEmpty() -> {
+            maxPages > 0 -> {
                 val listState = rememberLazyListState()
 
                 Column(modifier = Modifier.fillMaxSize()) {
@@ -1135,8 +878,8 @@ private fun PdfPreview(
                             )
                             Text(
                                 text =
-                                    if (pageCount > pdfPages.size) {
-                                        "Page $currentPage of ${pdfPages.size} ($pageCount total)"
+                                    if (pageCount > maxPages) {
+                                        "Page $currentPage of $maxPages ($pageCount total)"
                                     } else {
                                         "Page $currentPage of $pageCount"
                                     },
@@ -1146,29 +889,23 @@ private fun PdfPreview(
                         }
                     }
 
-                    // PDF pages
+                    // PDF pages - rendered lazily per visible item
                     LazyColumn(
                         state = listState,
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(16.dp),
                         verticalArrangement = Arrangement.spacedBy(16.dp),
                     ) {
-                        items(pdfPages.size) { index ->
-                            Card(
-                                modifier = Modifier.fillMaxWidth(),
-                                elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
-                            ) {
-                                Image(
-                                    bitmap = pdfPages[index].asImageBitmap(),
-                                    contentDescription = "Page ${index + 1}",
-                                    modifier = Modifier.fillMaxWidth(),
-                                    contentScale = ContentScale.FillWidth,
-                                )
-                            }
+                        items(maxPages) { index ->
+                            PdfPageItem(
+                                renderer = pdfRenderer,
+                                renderMutex = renderMutex,
+                                index = index,
+                            )
                         }
 
                         // Show indicator if there are more pages
-                        if (pageCount > pdfPages.size) {
+                        if (pageCount > maxPages) {
                             item {
                                 Card(
                                     modifier = Modifier.fillMaxWidth(),
@@ -1182,7 +919,7 @@ private fun PdfPreview(
                                         horizontalAlignment = Alignment.CenterHorizontally,
                                     ) {
                                         Text(
-                                            text = "${pageCount - pdfPages.size} more pages",
+                                            text = "${pageCount - maxPages} more pages",
                                             style = MaterialTheme.typography.titleMedium,
                                         )
                                         Spacer(modifier = Modifier.height(4.dp))
@@ -1231,6 +968,65 @@ private fun PdfPreview(
     }
 }
 
+/**
+ * A single lazily-rendered PDF page. The bitmap is produced only while the item
+ * is composed (visible) and drops out of memory when the item leaves composition.
+ */
+@Composable
+private fun PdfPageItem(
+    renderer: PdfRenderer?,
+    renderMutex: kotlinx.coroutines.sync.Mutex,
+    index: Int,
+) {
+    val bitmap by produceState<android.graphics.Bitmap?>(null, renderer, index) {
+        if (renderer == null) return@produceState
+        value =
+            withContext(Dispatchers.IO) {
+                renderMutex.withLock {
+                    try {
+                        val page = renderer.openPage(index)
+                        // Render at native page size (screen width), not 2x - keeps memory low
+                        val pageBitmap =
+                            Bitmap.createBitmap(page.width, page.height, Bitmap.Config.ARGB_8888)
+                        // Fill with white background
+                        pageBitmap.eraseColor(android.graphics.Color.WHITE)
+                        page.render(pageBitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        page.close()
+                        pageBitmap
+                    } catch (e: Exception) {
+                        android.util.Log.e("PdfPreview", "Failed to render page $index", e)
+                        null
+                    }
+                }
+            }
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
+    ) {
+        val pageBitmap = bitmap
+        if (pageBitmap != null) {
+            Image(
+                bitmap = pageBitmap.asImageBitmap(),
+                contentDescription = "Page ${index + 1}",
+                modifier = Modifier.fillMaxWidth(),
+                contentScale = ContentScale.FillWidth,
+            )
+        } else {
+            Box(
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .height(200.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                CircularProgressIndicator()
+            }
+        }
+    }
+}
+
 @Composable
 private fun UnsupportedPreview(s3Object: S3Object) {
     Column(
@@ -1267,32 +1063,4 @@ private fun UnsupportedPreview(s3Object: S3Object) {
     }
 }
 
-private fun openWithExternalApp(
-    context: Context,
-    file: File,
-    mimeType: String,
-) {
-    try {
-        val uri =
-            FileProvider.getUriForFile(
-                context,
-                "${context.packageName}.fileprovider",
-                file,
-            )
 
-        val intent =
-            Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, mimeType)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-
-        val chooser =
-            Intent.createChooser(intent, "Open with").apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-        context.startActivity(chooser)
-    } catch (e: Exception) {
-        Toast.makeText(context, "Failed to open: ${e.message}", Toast.LENGTH_SHORT).show()
-    }
-}

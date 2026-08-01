@@ -10,12 +10,9 @@ import androidx.work.Data
 import androidx.work.ForegroundInfo
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
-import aws.sdk.kotlin.runtime.auth.credentials.StaticCredentialsProvider
-import aws.sdk.kotlin.services.s3.S3Client
-import aws.sdk.kotlin.services.s3.model.PutObjectRequest
-import aws.smithy.kotlin.runtime.content.asByteStream
-import aws.smithy.kotlin.runtime.net.url.Url
+import com.imaviso.stash.data.remote.S3Service
 import com.imaviso.stash.data.repository.ConfigRepository
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
@@ -74,7 +71,7 @@ class UploadWorker(
     }
 
     private val notificationManager = TransferNotificationManager(applicationContext)
-    private val configRepository = ConfigRepository(applicationContext)
+    private val configRepository = ConfigRepository.getInstance(applicationContext)
 
     override suspend fun doWork(): Result =
         withContext(Dispatchers.IO) {
@@ -112,17 +109,24 @@ class UploadWorker(
                 setForeground(createForegroundInfo(fileName, 0, transferId))
 
                 // Copy URI content to temp file
+                // (fileName/bucket ride along so the transfer module's collector
+                // can build complete records for works surviving process death)
                 setProgress(
                     workDataOf(
                         KEY_STATUS to STATUS_PREPARING,
                         KEY_PROGRESS to 0,
+                        KEY_FILE_NAME to fileName,
+                        KEY_BUCKET_NAME to bucketName,
                     ),
                 )
 
+                // Copy URI content to a temp file; total size is unknown until
+                // the copy completes, so this phase reports bytes only.
                 val fileUri = Uri.parse(fileUriString)
                 val tempFile = File.createTempFile("upload_", ".tmp", applicationContext.cacheDir)
 
                 var totalBytes = 0L
+                var lastProgressBytes = 0L
                 applicationContext.contentResolver.openInputStream(fileUri)?.use { input ->
                     tempFile.outputStream().use { output ->
                         val buffer = ByteArray(8192)
@@ -130,6 +134,18 @@ class UploadWorker(
                         while (input.read(buffer).also { bytesRead = it } != -1) {
                             output.write(buffer, 0, bytesRead)
                             totalBytes += bytesRead
+
+                            // Publish ~every 1MB so the transfer list shows prep movement
+                            if (totalBytes - lastProgressBytes >= 1024 * 1024) {
+                                lastProgressBytes = totalBytes
+                                setProgress(
+                                    workDataOf(
+                                        KEY_STATUS to STATUS_PREPARING,
+                                        KEY_PROGRESS to 0,
+                                        KEY_BYTES_UPLOADED to totalBytes,
+                                    ),
+                                )
+                            }
                         }
                     }
                 } ?: return@withContext Result.failure(
@@ -138,38 +154,28 @@ class UploadWorker(
 
                 Log.d(TAG, "Temp file created: ${tempFile.length()} bytes")
 
-                // Update progress - preparing complete
                 setProgress(
                     workDataOf(
                         KEY_STATUS to STATUS_UPLOADING,
-                        KEY_PROGRESS to 10,
                         KEY_TOTAL_BYTES to totalBytes,
+                        KEY_BYTES_UPLOADED to totalBytes,
                     ),
                 )
-                setForeground(createForegroundInfo(fileName, 10, transferId))
+                setForeground(createForegroundInfo(fileName, 0, transferId))
 
-                // Create S3 client and upload
-                val s3Client =
-                    S3Client {
-                        region = config.region
-                        endpointUrl = Url.parse(config.endpoint)
-                        credentialsProvider =
-                            StaticCredentialsProvider {
-                                accessKeyId = config.accessKey
-                                secretAccessKey = config.secretKey
-                            }
-                        forcePathStyle = config.usePathStyle
-                    }
+                // Bind to the account read at execution start. The shared
+                // singleton may have been re-initialized to another account
+                // by a screen since this work was enqueued.
+                val s3 = S3Service.forAccount(config)
 
                 try {
-                    s3Client.putObject(
-                        PutObjectRequest {
-                            bucket = bucketName
-                            key = objectKey
-                            this.contentType = contentType
-                            body = tempFile.asByteStream()
-                        },
-                    )
+                    s3
+                        .uploadObjectFromFile(
+                            bucketName = bucketName,
+                            key = objectKey,
+                            file = tempFile,
+                            contentType = contentType,
+                        ).getOrThrow()
 
                     Log.d(TAG, "Upload complete: $fileName")
 
@@ -185,10 +191,11 @@ class UploadWorker(
                         ),
                     )
                 } finally {
-                    s3Client.close()
+                    s3.close()
                     tempFile.delete()
                 }
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 Log.e(TAG, "Upload failed: ${e.message}", e)
                 notificationManager.showUploadComplete(fileName, false, transferId)
                 Result.failure(

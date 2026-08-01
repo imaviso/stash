@@ -17,6 +17,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.imaviso.stash.data.model.S3Account
 import com.imaviso.stash.data.model.S3Bucket
@@ -33,11 +34,9 @@ fun BucketsScreen(
     onNavigateToTransfers: () -> Unit,
     viewModel: BucketsViewModel = viewModel(),
 ) {
-    val uiState by viewModel.uiState.collectAsState()
+    val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
-    val activeCountState =
-        com.imaviso.stash.data.repository.TransferRepository.transfers.collectAsState()
-    val activeCount = activeCountState.value.count { it.state == com.imaviso.stash.data.repository.TransferState.ACTIVE }
+    val activeCount by viewModel.activeTransferCount.collectAsStateWithLifecycle()
 
     val pullRefreshState =
         rememberPullRefreshState(

@@ -9,6 +9,7 @@ import aws.smithy.kotlin.runtime.content.ByteStream
 import aws.smithy.kotlin.runtime.content.asByteStream
 import aws.smithy.kotlin.runtime.content.toByteArray
 import aws.smithy.kotlin.runtime.net.url.Url
+import com.imaviso.stash.data.model.ObjectKey
 import com.imaviso.stash.data.model.S3Bucket
 import com.imaviso.stash.data.model.S3Config
 import com.imaviso.stash.data.model.S3Object
@@ -20,13 +21,49 @@ import java.util.Date
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.hours
 
-class S3Service {
+class S3Service private constructor(
+    private var currentConfig: S3Config? = null,
+) : S3Operations {
     companion object {
         private const val TAG = "S3Service"
+
+        @Volatile
+        private var instance: S3Service? = null
+
+        /**
+         * Process-wide singleton so account switches propagate to all screens
+         * and only one underlying S3Client exists.
+         */
+        fun getInstance(): S3Service =
+            instance ?: synchronized(this) {
+                instance ?: S3Service().also { instance = it }
+            }
+
+        /**
+         * Account-bound instance with its own private client, never swapped.
+         * Workers bind the account read at execution start through this so
+         * queued work can't race the shared singleton's current account.
+         */
+        fun forAccount(config: S3Config): S3Operations = S3Service(config)
     }
 
-    private var client: S3Client? = null
-    private var currentConfig: S3Config? = null
+    private var client: S3Client? = currentConfig?.let(::buildClient)
+
+    /**
+     * The single S3Client construction site: endpoint, region, credentials
+     * and path-style all resolve here.
+     */
+    private fun buildClient(config: S3Config): S3Client =
+        S3Client {
+            region = config.region
+            endpointUrl = Url.parse(config.endpoint)
+            credentialsProvider =
+                StaticCredentialsProvider {
+                    accessKeyId = config.accessKey
+                    secretAccessKey = config.secretKey
+                }
+            forcePathStyle = config.usePathStyle
+        }
 
     suspend fun initialize(config: S3Config) =
         withContext(Dispatchers.IO) {
@@ -36,33 +73,7 @@ class S3Service {
 
             Log.d(TAG, "Initializing S3 client with endpoint: ${config.endpoint}, region: ${config.region}")
 
-            // Test basic connectivity using HttpURLConnection
-            try {
-                Log.d(TAG, "Testing HTTP connectivity to ${config.endpoint}")
-                val url = URL(config.endpoint)
-                val connection = url.openConnection() as HttpURLConnection
-                connection.requestMethod = "GET"
-                connection.connectTimeout = 5000
-                connection.readTimeout = 5000
-                connection.connect()
-                val responseCode = connection.responseCode
-                Log.d(TAG, "HTTP connectivity test response code: $responseCode")
-                connection.disconnect()
-            } catch (e: Exception) {
-                Log.e(TAG, "HTTP connectivity test failed: ${e.javaClass.simpleName}: ${e.message}", e)
-            }
-
-            client =
-                S3Client {
-                    region = config.region
-                    endpointUrl = Url.parse(config.endpoint)
-                    credentialsProvider =
-                        StaticCredentialsProvider {
-                            accessKeyId = config.accessKey
-                            secretAccessKey = config.secretKey
-                        }
-                    forcePathStyle = config.usePathStyle
-                }
+            client = buildClient(config)
             currentConfig = config
 
             Log.d(TAG, "S3 client initialized successfully")
@@ -80,18 +91,8 @@ class S3Service {
             runCatching {
                 Log.d(TAG, "Testing connection to: ${config.endpoint}")
 
-                // Create temporary client for testing
-                val testClient =
-                    S3Client {
-                        region = config.region
-                        endpointUrl = Url.parse(config.endpoint)
-                        credentialsProvider =
-                            StaticCredentialsProvider {
-                                accessKeyId = config.accessKey
-                                secretAccessKey = config.secretKey
-                            }
-                        forcePathStyle = config.usePathStyle
-                    }
+                // Create temporary client for testing (not stored on this instance)
+                val testClient = buildClient(config)
 
                 try {
                     val response = testClient.listBuckets(ListBucketsRequest {})
@@ -108,7 +109,7 @@ class S3Service {
 
     // ==================== BUCKET OPERATIONS ====================
 
-    suspend fun listBuckets(): Result<List<S3Bucket>> =
+    override suspend fun listBuckets(): Result<List<S3Bucket>> =
         withContext(Dispatchers.IO) {
             runCatching {
                 Log.d(TAG, "Listing buckets...")
@@ -127,13 +128,21 @@ class S3Service {
             }
         }
 
-    suspend fun createBucket(name: String): Result<Unit> =
+    override suspend fun createBucket(name: String): Result<Unit> =
         withContext(Dispatchers.IO) {
             runCatching {
                 Log.d(TAG, "Creating bucket: $name")
+                val region = currentConfig?.region ?: "us-east-1"
                 requireClient().createBucket(
                     CreateBucketRequest {
                         bucket = name
+                        // AWS rejects buckets without a location constraint outside us-east-1
+                        if (region != "us-east-1") {
+                            createBucketConfiguration =
+                                CreateBucketConfiguration {
+                                    locationConstraint = BucketLocationConstraint.fromValue(region)
+                                }
+                        }
                     },
                 )
                 Log.d(TAG, "Bucket created: $name")
@@ -143,7 +152,7 @@ class S3Service {
             }
         }
 
-    suspend fun deleteBucket(name: String): Result<Unit> =
+    override suspend fun deleteBucket(name: String): Result<Unit> =
         withContext(Dispatchers.IO) {
             runCatching {
                 Log.d(TAG, "Deleting bucket: $name")
@@ -165,10 +174,10 @@ class S3Service {
      * List objects in a bucket with automatic pagination.
      * Fetches all objects by following continuation tokens.
      */
-    suspend fun listObjects(
+    override suspend fun listObjects(
         bucketName: String,
-        prefix: String = "",
-        delimiter: String = "/",
+        prefix: String,
+        delimiter: String,
     ): Result<List<S3Object>> =
         withContext(Dispatchers.IO) {
             runCatching {
@@ -214,7 +223,7 @@ class S3Service {
                     response.contents?.forEach { obj ->
                         val key = obj.key ?: ""
                         val isCurrentPrefix = key == prefix
-                        val isFolderMarker = key.endsWith("/") && (obj.size ?: 0) == 0L
+                        val isFolderMarker = ObjectKey(key).isFolder && (obj.size ?: 0) == 0L
                         val isAlreadyInFolders = folderKeys.contains(key)
 
                         if (key.isNotEmpty() && !isCurrentPrefix && !isAlreadyInFolders && !isFolderMarker) {
@@ -245,11 +254,11 @@ class S3Service {
             }
         }
 
-    suspend fun uploadObject(
+    override suspend fun uploadObject(
         bucketName: String,
         key: String,
         data: ByteArray,
-        contentType: String = "application/octet-stream",
+        contentType: String,
     ): Result<Unit> =
         withContext(Dispatchers.IO) {
             runCatching {
@@ -270,18 +279,44 @@ class S3Service {
         }
 
     /**
+     * Upload a file already on disk (worker temp files) - no extra copy.
+     */
+    override suspend fun uploadObjectFromFile(
+        bucketName: String,
+        key: String,
+        file: java.io.File,
+        contentType: String,
+    ): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                Log.d(TAG, "Uploading file: $key to bucket: $bucketName (${file.length()} bytes)")
+                requireClient().putObject(
+                    PutObjectRequest {
+                        bucket = bucketName
+                        this.key = key
+                        this.contentType = contentType
+                        body = file.asByteStream()
+                    },
+                )
+                Log.d(TAG, "File uploaded: $key")
+                Unit
+            }.onFailure { e ->
+                Log.e(TAG, "Failed to upload file: ${e.message}", e)
+            }
+        }
+
+    /**
      * Upload a file from InputStream - supports large files without loading into memory
      * Uses a temp file approach since AWS SDK streams from files efficiently
-     * @param onProgress callback with (bytesWritten, totalBytes, phase) - phase is "preparing" or "uploading"
      */
-    suspend fun uploadObjectFromStream(
+    override suspend fun uploadObjectFromStream(
         bucketName: String,
         key: String,
         inputStream: java.io.InputStream,
         contentLength: Long,
-        contentType: String = "application/octet-stream",
+        contentType: String,
         cacheDir: java.io.File,
-        onProgress: ((Long, Long, String) -> Unit)? = null,
+        onProgress: (suspend (Long, Long, String) -> Unit)?,
     ): Result<Unit> =
         withContext(Dispatchers.IO) {
             var tempFile: java.io.File? = null
@@ -331,7 +366,7 @@ class S3Service {
             }
         }
 
-    suspend fun downloadObject(
+    override suspend fun downloadObject(
         bucketName: String,
         key: String,
     ): Result<ByteArray> =
@@ -355,33 +390,40 @@ class S3Service {
         }
 
     /**
-     * Download a file with progress reporting - streams to a file to avoid OOM
-     * @param onProgress callback with (bytesWritten, totalBytes)
+     * The single presign path: manual SigV4 for path-style endpoints (the AWS
+     * SDK presigner mishandles them), SDK presigner for virtual-hosted style.
      */
-    suspend fun downloadObjectToFile(
+    private suspend fun presignGetObjectUrl(
+        bucketName: String,
+        key: String,
+        expiresIn: Duration,
+    ): String {
+        val config = currentConfig ?: throw IllegalStateException("S3 not configured")
+        return if (config.usePathStyle) {
+            Presigner.generatePresignedUrl(config, bucketName, key, expiresIn)
+        } else {
+            val request =
+                GetObjectRequest {
+                    bucket = bucketName
+                    this.key = key
+                }
+            requireClient().presignGetObject(request, expiresIn).url.toString()
+        }
+    }
+
+    override suspend fun downloadObjectToFile(
         bucketName: String,
         key: String,
         destFile: java.io.File,
         expectedSize: Long,
-        onProgress: ((Long, Long) -> Unit)? = null,
+        onProgress: (suspend (Long, Long) -> Unit)?,
     ): Result<Unit> =
         withContext(Dispatchers.IO) {
             runCatching {
                 Log.d(TAG, "Downloading object to file: $key from bucket: $bucketName")
 
-                // Get presigned URL and download via HttpURLConnection for progress
-                val config = currentConfig ?: throw IllegalStateException("S3 not configured")
-                val presignedUrl =
-                    if (config.usePathStyle) {
-                        generateManualPresignedUrl(config, bucketName, key, 1.hours)
-                    } else {
-                        val request =
-                            GetObjectRequest {
-                                bucket = bucketName
-                                this.key = key
-                            }
-                        requireClient().presignGetObject(request, 1.hours).url.toString()
-                    }
+                // Presigned URL + plain HTTP: the SDK's getObject can't report progress
+                val presignedUrl = presignGetObjectUrl(bucketName, key, 1.hours)
 
                 val url = URL(presignedUrl)
                 val connection = url.openConnection() as HttpURLConnection
@@ -422,13 +464,13 @@ class S3Service {
     /**
      * Create a folder (empty object with trailing slash)
      */
-    suspend fun createFolder(
+    override suspend fun createFolder(
         bucketName: String,
         folderPath: String,
     ): Result<Unit> =
         withContext(Dispatchers.IO) {
             runCatching {
-                val key = if (folderPath.endsWith("/")) folderPath else "$folderPath/"
+                val key = ObjectKey(folderPath).asFolder().key
                 Log.d(TAG, "Creating folder: $key in bucket: $bucketName")
                 requireClient().putObject(
                     PutObjectRequest {
@@ -444,43 +486,7 @@ class S3Service {
             }
         }
 
-    /**
-     * Rename/move an object (copy + delete)
-     */
-    suspend fun renameObject(
-        bucketName: String,
-        oldKey: String,
-        newKey: String,
-    ): Result<Unit> =
-        withContext(Dispatchers.IO) {
-            runCatching {
-                Log.d(TAG, "Renaming object from $oldKey to $newKey in bucket: $bucketName")
-
-                // Copy to new key
-                requireClient().copyObject(
-                    CopyObjectRequest {
-                        copySource = "$bucketName/$oldKey"
-                        bucket = bucketName
-                        key = newKey
-                    },
-                )
-
-                // Delete old key
-                requireClient().deleteObject(
-                    DeleteObjectRequest {
-                        bucket = bucketName
-                        key = oldKey
-                    },
-                )
-
-                Log.d(TAG, "Object renamed from $oldKey to $newKey")
-                Unit
-            }.onFailure { e ->
-                Log.e(TAG, "Failed to rename object: ${e.message}", e)
-            }
-        }
-
-    suspend fun deleteObject(
+    override suspend fun deleteObject(
         bucketName: String,
         key: String,
     ): Result<Unit> =
@@ -500,7 +506,7 @@ class S3Service {
             }
         }
 
-    suspend fun deleteObjects(
+    override suspend fun deleteObjects(
         bucketName: String,
         keys: List<String>,
     ): Result<Unit> =
@@ -526,41 +532,17 @@ class S3Service {
             }
         }
 
-    /**
-     * Generate a presigned URL for streaming large files (video/audio)
-     * This allows ExoPlayer to stream directly from S3 without loading into memory
-     *
-     * For Garage with path-style access, we manually sign the URL since the AWS SDK
-     * presigner doesn't correctly handle path-style URLs.
-     */
-    suspend fun getPresignedUrl(
+    override suspend fun getPresignedUrl(
         bucketName: String,
         key: String,
-        expiresIn: kotlin.time.Duration = 1.hours,
+        expiresIn: Duration,
     ): Result<String> =
         withContext(Dispatchers.IO) {
             runCatching {
                 Log.d(TAG, "Generating presigned URL for: $key in bucket: $bucketName")
-
-                val config = currentConfig ?: throw IllegalStateException("S3 not configured")
-
-                // For path-style access (Garage), we need to manually construct and sign the URL
-                // because AWS SDK presigner doesn't handle path-style correctly
-                if (config.usePathStyle) {
-                    val url = generateManualPresignedUrl(config, bucketName, key, expiresIn)
-                    Log.d(TAG, "Manually signed presigned URL generated: $url")
-                    return@runCatching url
-                }
-
-                // For virtual-hosted style (standard AWS), use SDK presigner
-                val request =
-                    GetObjectRequest {
-                        bucket = bucketName
-                        this.key = key
-                    }
-                val presignedRequest = requireClient().presignGetObject(request, expiresIn)
-                val url = presignedRequest.url.toString()
-                Log.d(TAG, "SDK presigned URL generated: $url")
+                val url = presignGetObjectUrl(bucketName, key, expiresIn)
+                // Never log the URL itself - it carries credentials + signature
+                Log.d(TAG, "Presigned URL generated (path-style: ${currentConfig?.usePathStyle})")
                 url
             }.onFailure { e ->
                 Log.e(TAG, "Failed to generate presigned URL: ${e.message}", e)
@@ -568,22 +550,12 @@ class S3Service {
         }
 
     /**
-     * Generate a presigned URL for sharing with configurable expiration.
-     * Wrapper around getPresignedUrl that accepts Duration directly.
-     */
-    suspend fun generateShareableUrl(
-        bucketName: String,
-        key: String,
-        expiresIn: Duration,
-    ): Result<String> = getPresignedUrl(bucketName, key, expiresIn)
-
-    /**
      * List all objects recursively under a prefix (for folder operations).
      * Returns flat list of all objects including nested ones.
      */
-    suspend fun listObjectsRecursive(
+    override suspend fun listObjectsRecursive(
         bucketName: String,
-        prefix: String = "",
+        prefix: String,
     ): Result<List<S3Object>> =
         withContext(Dispatchers.IO) {
             runCatching {
@@ -640,123 +612,16 @@ class S3Service {
         }
 
     /**
-     * Manually generate a presigned URL for path-style S3 access (Garage, MinIO, etc.)
-     * Uses AWS Signature Version 4
+     * URL-encode a CopyObject copySource ("bucket/key") so keys with spaces,
+     * '+' or unicode don't break the request. Segment encoding rules are
+     * owned by [ObjectKey.encoded].
      */
-    private fun generateManualPresignedUrl(
-        config: S3Config,
-        bucketName: String,
+    private fun encodeCopySource(
+        bucket: String,
         key: String,
-        expiresIn: kotlin.time.Duration,
-    ): String {
-        val endpoint = config.endpoint.trimEnd('/')
-        val region = config.region
-        val accessKey = config.accessKey
-        val secretKey = config.secretKey
+    ): String = "$bucket/${ObjectKey(key).encoded}"
 
-        // Use SimpleDateFormat for API 24 compatibility
-        val now = java.util.Date()
-        val dateTimeFormat =
-            java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'", java.util.Locale.US).apply {
-                timeZone = java.util.TimeZone.getTimeZone("UTC")
-            }
-        val dateFormat =
-            java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US).apply {
-                timeZone = java.util.TimeZone.getTimeZone("UTC")
-            }
-
-        val amzDate = dateTimeFormat.format(now)
-        val dateStamp = dateFormat.format(now)
-        val expiresSeconds = expiresIn.inWholeSeconds
-
-        // Parse endpoint to get host
-        val endpointUrl = java.net.URI(endpoint)
-        val host =
-            if (endpointUrl.port != -1 && endpointUrl.port != 80 && endpointUrl.port != 443) {
-                "${endpointUrl.host}:${endpointUrl.port}"
-            } else {
-                endpointUrl.host
-            }
-
-        // URL encode the key (but not the slashes for path)
-        val encodedKey =
-            java.net.URLEncoder
-                .encode(key, "UTF-8")
-                .replace("%2F", "/")
-                .replace("+", "%20")
-
-        val canonicalUri = "/$bucketName/$encodedKey"
-        val credentialScope = "$dateStamp/$region/s3/aws4_request"
-        val credential = java.net.URLEncoder.encode("$accessKey/$credentialScope", "UTF-8")
-
-        // Build canonical query string (sorted alphabetically)
-        val queryParams =
-            sortedMapOf(
-                "X-Amz-Algorithm" to "AWS4-HMAC-SHA256",
-                "X-Amz-Credential" to credential,
-                "X-Amz-Date" to amzDate,
-                "X-Amz-Expires" to expiresSeconds.toString(),
-                "X-Amz-SignedHeaders" to "host",
-            )
-
-        val canonicalQueryString = queryParams.entries.joinToString("&") { (k, v) -> "$k=$v" }
-
-        // Build canonical request
-        val canonicalHeaders = "host:$host\n"
-        val signedHeaders = "host"
-        val payloadHash = "UNSIGNED-PAYLOAD"
-
-        val canonicalRequest =
-            listOf(
-                "GET",
-                canonicalUri,
-                canonicalQueryString,
-                canonicalHeaders,
-                signedHeaders,
-                payloadHash,
-            ).joinToString("\n")
-
-        // Create string to sign
-        val canonicalRequestHash = sha256Hex(canonicalRequest)
-        val stringToSign =
-            listOf(
-                "AWS4-HMAC-SHA256",
-                amzDate,
-                credentialScope,
-                canonicalRequestHash,
-            ).joinToString("\n")
-
-        // Calculate signature
-        val kDate = hmacSha256("AWS4$secretKey".toByteArray(), dateStamp)
-        val kRegion = hmacSha256(kDate, region)
-        val kService = hmacSha256(kRegion, "s3")
-        val kSigning = hmacSha256(kService, "aws4_request")
-        val signature = hmacSha256Hex(kSigning, stringToSign)
-
-        return "$endpoint$canonicalUri?$canonicalQueryString&X-Amz-Signature=$signature"
-    }
-
-    private fun sha256Hex(data: String): String {
-        val digest = java.security.MessageDigest.getInstance("SHA-256")
-        val hash = digest.digest(data.toByteArray(Charsets.UTF_8))
-        return hash.joinToString("") { "%02x".format(it) }
-    }
-
-    private fun hmacSha256(
-        key: ByteArray,
-        data: String,
-    ): ByteArray {
-        val mac = javax.crypto.Mac.getInstance("HmacSHA256")
-        mac.init(javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"))
-        return mac.doFinal(data.toByteArray(Charsets.UTF_8))
-    }
-
-    private fun hmacSha256Hex(
-        key: ByteArray,
-        data: String,
-    ): String = hmacSha256(key, data).joinToString("") { "%02x".format(it) }
-
-    suspend fun copyObject(
+    override suspend fun copyObject(
         sourceBucket: String,
         sourceKey: String,
         destBucket: String,
@@ -767,7 +632,7 @@ class S3Service {
                 Log.d(TAG, "Copying object from $sourceBucket/$sourceKey to $destBucket/$destKey")
                 requireClient().copyObject(
                     CopyObjectRequest {
-                        copySource = "$sourceBucket/$sourceKey"
+                        copySource = encodeCopySource(sourceBucket, sourceKey)
                         bucket = destBucket
                         key = destKey
                     },
@@ -779,7 +644,29 @@ class S3Service {
             }
         }
 
-    fun close() {
+    override suspend fun objectExists(
+        bucketName: String,
+        key: String,
+    ): Result<Boolean> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                try {
+                    requireClient().headObject(
+                        HeadObjectRequest {
+                            bucket = bucketName
+                            this.key = key
+                        },
+                    )
+                    true
+                } catch (e: NoSuchKey) {
+                    false
+                } catch (e: NotFound) {
+                    false
+                }
+            }
+        }
+
+    override fun close() {
         Log.d(TAG, "Closing S3 client")
         client?.close()
         client = null

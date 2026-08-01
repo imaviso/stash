@@ -13,15 +13,19 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.imaviso.stash.data.model.S3Account
 import com.imaviso.stash.data.model.S3Config
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
 val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "s3_config")
 
-class ConfigRepository(
+class ConfigRepository private constructor(
     private val context: Context,
 ) {
     companion object {
@@ -29,7 +33,7 @@ class ConfigRepository(
         private const val ENCRYPTED_PREFS_NAME = "secure_credentials"
         private const val KEY_ACCOUNTS_JSON = "accounts_json"
 
-        // Legacy single account keys (for backward compatibility)
+        // Legacy single account keys (read once for migration into encrypted storage)
         private val ENDPOINT = stringPreferencesKey("endpoint")
         private val ACCESS_KEY = stringPreferencesKey("access_key")
         private val SECRET_KEY = stringPreferencesKey("secret_key")
@@ -45,10 +49,35 @@ class ConfigRepository(
 
         // App lock (biometric) setting
         private val APP_LOCK_ENABLED = booleanPreferencesKey("app_lock_enabled")
+
+        @Volatile
+        private var instance: ConfigRepository? = null
+
+        /**
+         * Process-wide singleton. Keystore + disk initialization happens lazily
+         * off the main thread (see [securePrefs]).
+         */
+        fun getInstance(context: Context): ConfigRepository =
+            instance ?: synchronized(this) {
+                instance ?: ConfigRepository(context.applicationContext).also { instance = it }
+            }
     }
 
-    // Encrypted SharedPreferences for secure credential storage
-    private val encryptedPrefs: SharedPreferences by lazy {
+    // Encrypted SharedPreferences for secure credential storage.
+    // Created lazily off the main thread (keystore + disk IO are expensive).
+    @Volatile
+    private var encryptedPrefs: SharedPreferences? = null
+    private val encryptedPrefsMutex = Mutex()
+
+    private suspend fun securePrefs(): SharedPreferences {
+        encryptedPrefs?.let { return it }
+        return encryptedPrefsMutex.withLock {
+            encryptedPrefs?.let { return@withLock it }
+            withContext(Dispatchers.IO) { createEncryptedPrefs() }.also { encryptedPrefs = it }
+        }
+    }
+
+    private fun createEncryptedPrefs(): SharedPreferences =
         try {
             val masterKey =
                 MasterKey
@@ -68,135 +97,88 @@ class ConfigRepository(
             // Fallback to regular SharedPreferences if encryption fails
             context.getSharedPreferences(ENCRYPTED_PREFS_NAME, Context.MODE_PRIVATE)
         }
-    }
 
     // Helper to get accounts from encrypted storage
-    private fun getAccountsFromSecureStorage(): List<S3Account> {
-        val json = encryptedPrefs.getString(KEY_ACCOUNTS_JSON, null) ?: return emptyList()
+    private suspend fun getAccountsFromSecureStorage(): List<S3Account> {
+        val json = securePrefs().getString(KEY_ACCOUNTS_JSON, null) ?: return emptyList()
         return parseAccounts(json)
     }
 
     // Helper to save accounts to encrypted storage
-    private fun saveAccountsToSecureStorage(accounts: List<S3Account>) {
-        encryptedPrefs
+    private suspend fun saveAccountsToSecureStorage(accounts: List<S3Account>) {
+        securePrefs()
             .edit()
             .putString(KEY_ACCOUNTS_JSON, serializeAccounts(accounts))
             .apply()
     }
 
-    // Initialize and migrate from unencrypted storage if needed
-    init {
-        migrateToEncryptedStorage()
-    }
-
-    private fun migrateToEncryptedStorage() {
-        // Check if we already have accounts in encrypted storage
-        val encryptedAccounts = getAccountsFromSecureStorage()
-        if (encryptedAccounts.isNotEmpty()) {
-            return // Already migrated
+    /**
+     * Accounts from encrypted storage, migrating legacy DataStore credentials
+     * (multi-account JSON or single account) into encrypted storage on first read.
+     */
+    private suspend fun migratedAccounts(prefs: Preferences): List<S3Account> {
+        val accounts = getAccountsFromSecureStorage()
+        if (accounts.isNotEmpty()) {
+            return accounts
         }
 
-        // Migration happens asynchronously on first access via configFlow
-        Log.d(TAG, "Will check for legacy accounts to migrate on first access")
+        // Check for legacy accounts to migrate
+        val legacyAccountsJson = prefs[ACCOUNTS_JSON]
+        if (legacyAccountsJson != null) {
+            val legacyAccounts = parseAccounts(legacyAccountsJson)
+            if (legacyAccounts.isNotEmpty()) {
+                Log.d(TAG, "Migrating ${legacyAccounts.size} accounts to encrypted storage")
+                saveAccountsToSecureStorage(legacyAccounts)
+                return legacyAccounts
+            }
+        }
+
+        // Check for legacy single account
+        val legacyEndpoint = prefs[ENDPOINT]
+        if (!legacyEndpoint.isNullOrBlank()) {
+            val legacyAccount =
+                S3Account(
+                    id = "legacy",
+                    name = "Default Account",
+                    endpoint = legacyEndpoint,
+                    accessKey = prefs[ACCESS_KEY] ?: "",
+                    secretKey = prefs[SECRET_KEY] ?: "",
+                    region = prefs[REGION] ?: "us-east-1",
+                    usePathStyle = prefs[USE_PATH_STYLE] ?: true,
+                )
+            Log.d(TAG, "Migrating legacy single account to encrypted storage")
+            saveAccountsToSecureStorage(listOf(legacyAccount))
+            return listOf(legacyAccount)
+        }
+
+        return emptyList()
     }
 
     // Legacy config flow for backward compatibility
     val configFlow: Flow<S3Config> =
         context.dataStore.data.map { prefs ->
-            // First check encrypted storage for active account
             val activeId = prefs[ACTIVE_ACCOUNT_ID]
-            val accounts = getAccountsFromSecureStorage()
-
-            if (activeId != null && accounts.isNotEmpty()) {
-                val activeAccount = accounts.find { it.id == activeId }
-                if (activeAccount != null) {
-                    return@map activeAccount.toConfig()
+            val accounts = migratedAccounts(prefs)
+            val activeAccount =
+                if (activeId != null) {
+                    accounts.find { it.id == activeId } ?: accounts.firstOrNull()
+                } else {
+                    accounts.firstOrNull()
                 }
-            }
-
-            // Check for legacy unencrypted accounts and migrate
-            val legacyAccountsJson = prefs[ACCOUNTS_JSON]
-            if (legacyAccountsJson != null && accounts.isEmpty()) {
-                val legacyAccounts = parseAccounts(legacyAccountsJson)
-                if (legacyAccounts.isNotEmpty()) {
-                    Log.d(TAG, "Migrating ${legacyAccounts.size} accounts to encrypted storage")
-                    saveAccountsToSecureStorage(legacyAccounts)
-                    val activeAccount =
-                        if (activeId != null) {
-                            legacyAccounts.find { it.id == activeId }
-                        } else {
-                            legacyAccounts.firstOrNull()
-                        }
-                    if (activeAccount != null) {
-                        return@map activeAccount.toConfig()
-                    }
-                }
-            }
-
-            // Fall back to legacy single account
-            val legacyEndpoint = prefs[ENDPOINT]
-            if (!legacyEndpoint.isNullOrBlank()) {
-                val legacyAccount =
-                    S3Account(
-                        id = "legacy",
-                        name = "Default Account",
-                        endpoint = legacyEndpoint,
-                        accessKey = prefs[ACCESS_KEY] ?: "",
-                        secretKey = prefs[SECRET_KEY] ?: "",
-                        region = prefs[REGION] ?: "us-east-1",
-                        usePathStyle = prefs[USE_PATH_STYLE] ?: true,
-                    )
-                // Migrate single legacy account to encrypted storage
-                Log.d(TAG, "Migrating legacy single account to encrypted storage")
-                saveAccountsToSecureStorage(listOf(legacyAccount))
-                return@map legacyAccount.toConfig()
-            }
-
-            S3Config(
-                endpoint = "",
-                accessKey = "",
-                secretKey = "",
-                region = "us-east-1",
-                usePathStyle = true,
-            )
+            activeAccount?.toConfig()
+                ?: S3Config(
+                    endpoint = "",
+                    accessKey = "",
+                    secretKey = "",
+                    region = "us-east-1",
+                    usePathStyle = true,
+                )
         }
 
     // Flow for all saved accounts (from encrypted storage)
     val accountsFlow: Flow<List<S3Account>> =
         context.dataStore.data.map { prefs ->
-            val accounts = getAccountsFromSecureStorage()
-            if (accounts.isNotEmpty()) {
-                return@map accounts
-            }
-
-            // Check for legacy accounts to migrate
-            val legacyAccountsJson = prefs[ACCOUNTS_JSON]
-            if (legacyAccountsJson != null) {
-                val legacyAccounts = parseAccounts(legacyAccountsJson)
-                if (legacyAccounts.isNotEmpty()) {
-                    saveAccountsToSecureStorage(legacyAccounts)
-                    return@map legacyAccounts
-                }
-            }
-
-            // Check for legacy single account
-            val legacyEndpoint = prefs[ENDPOINT]
-            if (!legacyEndpoint.isNullOrBlank()) {
-                val legacyAccount =
-                    S3Account(
-                        id = "legacy",
-                        name = "Default Account",
-                        endpoint = legacyEndpoint,
-                        accessKey = prefs[ACCESS_KEY] ?: "",
-                        secretKey = prefs[SECRET_KEY] ?: "",
-                        region = prefs[REGION] ?: "us-east-1",
-                        usePathStyle = prefs[USE_PATH_STYLE] ?: true,
-                    )
-                saveAccountsToSecureStorage(listOf(legacyAccount))
-                return@map listOf(legacyAccount)
-            }
-
-            emptyList()
+            migratedAccounts(prefs)
         }
 
     // Flow for active account ID
@@ -209,14 +191,12 @@ class ConfigRepository(
     val activeAccountFlow: Flow<S3Account?> =
         context.dataStore.data.map { prefs ->
             val activeId = prefs[ACTIVE_ACCOUNT_ID]
-            val accounts = getAccountsFromSecureStorage()
+            val accounts = migratedAccounts(prefs)
 
             if (activeId != null && accounts.isNotEmpty()) {
-                accounts.find { it.id == activeId }
-            } else if (accounts.isNotEmpty()) {
-                accounts.firstOrNull()
+                accounts.find { it.id == activeId } ?: accounts.firstOrNull()
             } else {
-                null
+                accounts.firstOrNull()
             }
         }
 
@@ -247,9 +227,14 @@ class ConfigRepository(
         saveAccountsToSecureStorage(accounts)
 
         context.dataStore.edit { prefs ->
-            // If deleted account was active, switch to first available
+            // If deleted account was active, fall back to the first remaining account
             if (prefs[ACTIVE_ACCOUNT_ID] == accountId) {
-                prefs[ACTIVE_ACCOUNT_ID] = accounts.firstOrNull()?.id ?: ""
+                val next = accounts.firstOrNull()?.id
+                if (next != null) {
+                    prefs[ACTIVE_ACCOUNT_ID] = next
+                } else {
+                    prefs.remove(ACTIVE_ACCOUNT_ID)
+                }
             }
         }
     }
@@ -261,20 +246,9 @@ class ConfigRepository(
         }
     }
 
-    // Legacy save method for backward compatibility
-    suspend fun saveConfig(config: S3Config) {
-        context.dataStore.edit { prefs ->
-            prefs[ENDPOINT] = config.endpoint
-            prefs[ACCESS_KEY] = config.accessKey
-            prefs[SECRET_KEY] = config.secretKey
-            prefs[REGION] = config.region
-            prefs[USE_PATH_STYLE] = config.usePathStyle
-        }
-    }
-
     suspend fun clearConfig() {
         // Clear encrypted credentials
-        encryptedPrefs.edit().clear().apply()
+        securePrefs().edit().clear().apply()
         // Clear DataStore
         context.dataStore.edit { it.clear() }
     }
@@ -317,8 +291,6 @@ class ConfigRepository(
             emptyList()
         }
 
-    // ==================== NAVIGATION STATE ====================
-
     // ==================== APP LOCK ====================
 
     val appLockEnabledFlow: Flow<Boolean> =
@@ -327,6 +299,8 @@ class ConfigRepository(
     suspend fun setAppLockEnabled(enabled: Boolean) {
         context.dataStore.edit { prefs -> prefs[APP_LOCK_ENABLED] = enabled }
     }
+
+    // ==================== NAVIGATION STATE ====================
 
     /**
      * Data class to hold navigation state for a bucket

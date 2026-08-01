@@ -22,20 +22,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.imaviso.stash.data.model.S3Object
+import com.imaviso.stash.data.model.SharedFileInfo
+import com.imaviso.stash.ui.components.BreadcrumbNavigation
+import com.imaviso.stash.ui.components.CreateFolderDialog
 import com.imaviso.stash.ui.viewmodel.ShareUploadViewModel
-import kotlinx.coroutines.launch
-
-/**
- * Data class representing a file to be uploaded
- */
-data class SharedFileInfo(
-    val uri: Uri,
-    val fileName: String,
-    val mimeType: String,
-    val size: Long,
-)
+import com.imaviso.stash.util.FormatUtils
 
 /**
  * Screen for uploading files shared from other apps.
@@ -50,9 +44,8 @@ fun ShareUploadScreen(
     viewModel: ShareUploadViewModel = viewModel(),
 ) {
     val context = LocalContext.current
-    val uiState by viewModel.uiState.collectAsState()
+    val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
-    val coroutineScope = rememberCoroutineScope()
 
     // Extract file info from URIs
     val sharedFiles =
@@ -174,9 +167,8 @@ fun ShareUploadScreen(
 
                         Button(
                             onClick = {
-                                coroutineScope.launch {
-                                    viewModel.uploadFiles(context, sharedFiles)
-                                }
+                                // Upload runs in the ViewModel's viewModelScope
+                                viewModel.uploadFiles(sharedFiles)
                             },
                             modifier = Modifier.fillMaxWidth(),
                             enabled = !uiState.isUploading,
@@ -312,13 +304,17 @@ fun ShareUploadScreen(
 
                     // Breadcrumb navigation
                     if (uiState.pathHistory.isNotEmpty()) {
-                        BreadcrumbRow(
+                        BreadcrumbNavigation(
                             pathHistory = uiState.pathHistory,
-                            onNavigateToRoot = { viewModel.navigateToRoot() },
-                            onNavigateToIndex = { index ->
-                                // Navigate to specific path in history
-                                repeat(uiState.pathHistory.size - index - 1) {
-                                    viewModel.navigateUp()
+                            rootLabel = "/",
+                            onNavigateToSegment = { index ->
+                                if (index == 0) {
+                                    viewModel.navigateToRoot()
+                                } else {
+                                    // Navigate to specific path in history
+                                    repeat(uiState.pathHistory.size - index - 1) {
+                                        viewModel.navigateUp()
+                                    }
                                 }
                             },
                         )
@@ -426,78 +422,11 @@ fun ShareUploadScreen(
 
     // Create Folder Dialog
     if (uiState.showCreateFolderDialog) {
-        CreateFolderDialogShare(
+        CreateFolderDialog(
             onConfirm = { folderName -> viewModel.createFolder(folderName) },
             onDismiss = { viewModel.hideCreateFolderDialog() },
             isCreating = uiState.isCreatingFolder,
         )
-    }
-}
-
-@Composable
-private fun BreadcrumbRow(
-    pathHistory: List<String>,
-    onNavigateToRoot: () -> Unit,
-    onNavigateToIndex: (Int) -> Unit,
-) {
-    val scrollState = rememberScrollState()
-
-    Row(
-        modifier =
-            Modifier
-                .fillMaxWidth()
-                .horizontalScroll(scrollState)
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        // Root
-        TextButton(
-            onClick = onNavigateToRoot,
-            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-        ) {
-            Icon(
-                Icons.Default.Home,
-                contentDescription = null,
-                modifier = Modifier.size(16.dp),
-            )
-            Spacer(modifier = Modifier.width(4.dp))
-            Text("/", style = MaterialTheme.typography.bodyMedium)
-        }
-
-        // Path segments
-        pathHistory.drop(1).forEachIndexed { index, path ->
-            Icon(
-                Icons.Default.ChevronRight,
-                contentDescription = null,
-                modifier = Modifier.size(16.dp),
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-
-            val segmentName = path.trimEnd('/').substringAfterLast('/')
-            val isLast = index == pathHistory.size - 2
-
-            TextButton(
-                onClick = { onNavigateToIndex(index + 1) },
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-            ) {
-                Text(
-                    text = segmentName,
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = if (isLast) androidx.compose.ui.text.font.FontWeight.Bold else null,
-                    color =
-                        if (isLast) {
-                            MaterialTheme.colorScheme.primary
-                        } else {
-                            MaterialTheme.colorScheme.onSurface
-                        },
-                )
-            }
-        }
-    }
-
-    // Auto-scroll to end when path changes
-    LaunchedEffect(pathHistory) {
-        scrollState.animateScrollTo(scrollState.maxValue)
     }
 }
 
@@ -567,7 +496,7 @@ private fun SharedFileItem(file: SharedFileInfo) {
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                text = formatFileSize(file.size),
+                text = FormatUtils.formatBytes(file.size),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -609,50 +538,6 @@ private fun NoAccountConfigured(onCancel: () -> Unit) {
     }
 }
 
-@Composable
-private fun CreateFolderDialogShare(
-    onConfirm: (String) -> Unit,
-    onDismiss: () -> Unit,
-    isCreating: Boolean,
-) {
-    var folderName by remember { mutableStateOf("") }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Create Folder") },
-        text = {
-            OutlinedTextField(
-                value = folderName,
-                onValueChange = { folderName = it },
-                label = { Text("Folder name") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-        },
-        confirmButton = {
-            Button(
-                onClick = { onConfirm(folderName) },
-                enabled = !isCreating && folderName.isNotBlank(),
-            ) {
-                if (isCreating) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(16.dp),
-                        strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.onPrimary,
-                    )
-                } else {
-                    Text("Create")
-                }
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Cancel")
-            }
-        },
-    )
-}
-
 private fun getFileIcon(mimeType: String) =
     when {
         mimeType.startsWith("image/") -> Icons.Default.Image
@@ -661,14 +546,6 @@ private fun getFileIcon(mimeType: String) =
         mimeType == "application/pdf" -> Icons.Default.PictureAsPdf
         mimeType.startsWith("text/") -> Icons.Default.Description
         else -> Icons.AutoMirrored.Filled.InsertDriveFile
-    }
-
-private fun formatFileSize(bytes: Long): String =
-    when {
-        bytes < 1024 -> "$bytes B"
-        bytes < 1024 * 1024 -> "%.1f KB".format(bytes / 1024f)
-        bytes < 1024 * 1024 * 1024 -> "%.1f MB".format(bytes / (1024f * 1024f))
-        else -> "%.2f GB".format(bytes / (1024f * 1024f * 1024f))
     }
 
 private fun getFileInfo(
